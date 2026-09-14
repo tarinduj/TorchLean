@@ -380,8 +380,8 @@ node list alone would not make an out-of-range output identifier usable.
 #check @parseGraph_wellShaped
 ```
 ```leanOutput ffiThm (whitespace := lax)
-@parseGraph_wellShaped : ∀ {j : Json} {cg : CapturedGraph},
-  parseGraph j = Except.ok cg → cg.graph.WellShaped
+@parseGraph_wellShaped : ∀ {j : Json} {env : Internal.DimEnv} {cg : CapturedGraph},
+  parseGraph j env = Except.ok cg → cg.graph.WellShaped
 ```
 
 The conclusion is the property `WellShaped`, defined by the executable checker's success:

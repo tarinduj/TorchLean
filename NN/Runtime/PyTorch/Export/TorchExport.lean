@@ -81,11 +81,22 @@ def bridgeImports : Array String :=
 
 /-- Shape readers for FX node metadata plus the `getitem`/`getattr` target tests. -/
 def shapeHelpers : Array String :=
-  #[ "def _shape_of(value):"
+  #[ "_DIM_NAMES = {}      # sympy symbol -> declared dynamic dim name, set by _capture"
+   , "_DIM_RANGES = {}     # dim name -> (min, max or None), set by _capture"
+   , ""
+   , "def _dim(x):"
+   , indentFour "# A size is an int, or the name of a dim declared dynamic at capture; nothing else."
+   , indentFour "if isinstance(x, torch.SymInt):"
+   , indentEight "expr = x.node.expr"
+   , indentEight "if expr in _DIM_NAMES: return _DIM_NAMES[expr]"
+   , indentEight "raise NotImplementedError(f\"size {x} is not a declared dynamic dim\")"
+   , indentFour "return int(x)"
+   , ""
+   , "def _shape_of(value):"
    , indentFour "if hasattr(value, \"shape\"):"
-   , indentEight "return [int(x) for x in tuple(value.shape)]"
+   , indentEight "return [_dim(x) for x in tuple(value.shape)]"
    , indentFour "if isinstance(value, (tuple, list)) and value and hasattr(value[0], \"shape\"):"
-   , indentEight "return [int(x) for x in tuple(value[0].shape)]"
+   , indentEight "return [_dim(x) for x in tuple(value[0].shape)]"
    , indentFour "return []"
    , ""
    , "def _node_shape(node):"
@@ -719,12 +730,31 @@ def lowerabilitySection : Array String :=
 
 /-- Graph capture: `torch.export` when preferred and lowerable, otherwise FX symbolic tracing. -/
 def captureSection (options : GraphBridgeOptions) : Array String :=
-  #[ "def _capture(model, example, require_torch_export=False):"
-   , indentFour "global _TENSOR_VALUES"
-   , indentFour "_TENSOR_VALUES = {}"
+  #[ "def _record_dynamic_dims(ep, dynamic_shapes):"
+   , indentFour "# dynamic_shapes: {axis: torch.export.Dim} for the user input. Every declared axis"
+   , indentFour "# must have stayed symbolic. torch.export itself rejects axes it would have to tie."
+   , indentFour "user_inputs = [spec.arg.name for spec in ep.graph_signature.input_specs"
+   , indentFour "               if getattr(spec.kind, \"name\", \"\") == \"USER_INPUT\"]"
+   , indentFour "placeholder = next(n for n in ep.graph.nodes if n.op == \"placeholder\" and n.name in user_inputs)"
+   , indentFour "for axis, dim in dynamic_shapes.items():"
+   , indentEight "size = placeholder.meta[\"val\"].shape[axis]"
+   , indentEight "if not isinstance(size, torch.SymInt):"
+   , indentEight "    raise NotImplementedError(f\"torch.export specialized {dim.__name__} to {int(size)}\")"
+   , indentEight "_DIM_NAMES[size.node.expr] = dim.__name__"
+   , indentEight "bounds = ep.range_constraints.get(size.node.expr)"
+   , indentEight "lo = int(bounds.lower) if bounds is not None and str(bounds.lower).isdigit() else 0"
+   , indentEight "hi = int(bounds.upper) if bounds is not None and str(bounds.upper).isdigit() else None"
+   , indentEight "_DIM_RANGES[dim.__name__] = (lo, hi)"
+   , ""
+   , "def _capture(model, example, require_torch_export=False, dynamic_shapes=None):"
+   , indentFour "global _TENSOR_VALUES, _DIM_NAMES, _DIM_RANGES"
+   , indentFour "_TENSOR_VALUES, _DIM_NAMES, _DIM_RANGES = {}, {}, {}"
+   , indentFour "if dynamic_shapes is not None: require_torch_export = True   # FX tracing has no symbolic sizes"
    , indentFour "if " ++ pyBool options.preferTorchExport ++ ":"
    , indentEight "try:"
-   , indentEight "    ep = torch.export.export(model, (example,))"
+   , indentEight "    ep = torch.export.export(model, (example,),"
+   , indentEight "                             dynamic_shapes=None if dynamic_shapes is None else (dynamic_shapes,))"
+   , indentEight "    if dynamic_shapes is not None: _record_dynamic_dims(ep, dynamic_shapes)"
    , indentEight "    # Functionalization can turn mutation into ordinary tensor operations."
    , indentEight "    # Extra outputs describe state updates that need their own replay rules."
    , indentEight ("    if any(spec.kind.name != \"USER_OUTPUT\" for " ++
@@ -770,8 +800,8 @@ def captureSection (options : GraphBridgeOptions) : Array String :=
 
 /-- The exported entry point: walk the captured graph and write the artifact. -/
 def exportFunctionSection (options : GraphBridgeOptions) : Array String :=
-  #[ s!"def {options.functionName}(model, example, json_path: str, require_torch_export=False):"
-   , indentFour "graph, user_input_names = _capture(model, example, require_torch_export)"
+  #[ s!"def {options.functionName}(model, example, json_path: str, require_torch_export=False, dynamic_shapes=None):"
+   , indentFour "graph, user_input_names = _capture(model, example, require_torch_export, dynamic_shapes)"
    , indentFour "nodes = []"
    , indentFour "node_to_id = {}"
    , indentFour "output_ids = None"
@@ -829,6 +859,9 @@ def exportFunctionSection (options : GraphBridgeOptions) : Array String :=
    , indentEight "raise RuntimeError(\"could not identify graph input/output\")"
    , indentFour ("payload = {\"format\": FORMAT, \"input_id\": input_id, \"output_ids\": " ++
        "output_ids, \"nodes\": nodes}")
+   , indentFour "if dynamic_shapes is not None:"
+   , indentEight "payload[\"dims\"] = [{\"name\": dim.__name__, \"min\": _DIM_RANGES[dim.__name__][0],"
+   , indentEight "                    \"max\": _DIM_RANGES[dim.__name__][1]} for dim in dynamic_shapes.values()]"
    , indentFour "with open(json_path, \"w\", encoding=\"utf-8\") as f:"
    , indentEight "json.dump(payload, f, indent=2, sort_keys=True)"
    , indentFour "return payload"

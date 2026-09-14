@@ -178,6 +178,25 @@ def parseNatArray (ctx : String) (j : Json) : Except String (Array Nat) := do
   let xs ← jsonArray ctx j
   xs.mapM (jsonNat ctx)
 
+/-- Sizes of dims the capture declared dynamic, by name. Absent names are errors. -/
+abbrev DimEnv := String → Option Nat
+
+/-- No named dims: every size must be a number. -/
+def DimEnv.none : DimEnv := fun _ => Option.none
+
+/-- A size: a number, or the name of a declared dim. -/
+def jsonDim (env : DimEnv) (ctx : String) : Json → Except String Nat
+  | .str name =>
+      match env name with
+      | some n => pure n
+      | Option.none => throw s!"PyTorch graph import: {ctx}: dim `{name}` is not bound"
+  | j => jsonNat ctx j
+
+/-- Parse a size list whose entries may be dim names. -/
+def parseDimArray (env : DimEnv) (ctx : String) (j : Json) : Except String (Array Nat) := do
+  let xs ← jsonArray ctx j
+  xs.mapM (jsonDim env ctx)
+
 /--
 Parse a shape encoded as a dimension list.
 
@@ -186,8 +205,8 @@ Examples:
 - `[4]` means `Shape.dim 4 Shape.scalar`;
 - `[2, 3]` means `Shape.dim 2 (Shape.dim 3 Shape.scalar)`.
 -/
-def parseShape (ctx : String) (j : Json) : Except String Shape := do
-  pure (Shape.ofArray (← parseNatArray ctx j))
+def parseShape (env : DimEnv) (ctx : String) (j : Json) : Except String Shape := do
+  pure (Shape.ofArray (← parseDimArray env ctx j))
 
 /-- Parse a node's parent ids. -/
 def parseParents (ctx : String) (j : Json) : Except String (Array Nat) :=
@@ -204,8 +223,8 @@ def boolField (ctx key : String) (o : StateDict) : Except String Bool := do
   | bad => typeError s!"{ctx}.{key}" "boolean" bad
 
 /-- Read a shape-valued field from a parsed Torch export JSON object. -/
-def shapeField (ctx key : String) (o : StateDict) : Except String Shape := do
-  parseShape s!"{ctx}.{key}" (← field ctx key o)
+def shapeField (env : DimEnv) (ctx key : String) (o : StateDict) : Except String Shape := do
+  parseShape env s!"{ctx}.{key}" (← field ctx key o)
 
 /-- Read a natural-number array field from a parsed Torch export JSON object. -/
 def natArrayField (ctx key : String) (o : StateDict) : Except String (Array Nat) := do
@@ -243,9 +262,9 @@ def windowConfig (ctx : String) (o : StateDict) : Except String WindowConfig := 
       padding := ← natTensorField ctx "padding" spatialRank o }
 
 /-- Parse a JSON array whose elements are shape arrays. -/
-def parseShapeArray (ctx : String) (j : Json) : Except String (Array Shape) := do
+def parseShapeArray (env : DimEnv) (ctx : String) (j : Json) : Except String (Array Shape) := do
   let xs ← jsonArray ctx j
-  xs.mapM (parseShape ctx)
+  xs.mapM (parseShape env ctx)
 
 /--
 Parse the value-level shape metadata emitted by the Python bridge.
@@ -254,12 +273,12 @@ Parse the value-level shape metadata emitted by the Python bridge.
 required `shape` field. The explicit form uses `value_kind = "tensor"` or
 `value_kind = "tuple"` explicitly.
 -/
-def parseValueShape (ctx : String) (o : StateDict) : Except String ValueShape := do
+def parseValueShape (env : DimEnv) (ctx : String) (o : StateDict) : Except String ValueShape := do
   match field? "value_kind" o with
-  | none => pure (.tensor (← shapeField ctx "shape" o))
-  | some (.str "tensor") => pure (.tensor (← shapeField ctx "shape" o))
+  | none => pure (.tensor (← shapeField env ctx "shape" o))
+  | some (.str "tensor") => pure (.tensor (← shapeField env ctx "shape" o))
   | some (.str "tuple") =>
-      pure (.tuple (← parseShapeArray s!"{ctx}.tuple_shapes" (← field ctx "tuple_shapes" o)))
+      pure (.tuple (← parseShapeArray env s!"{ctx}.tuple_shapes" (← field ctx "tuple_shapes" o)))
   | some (.str other) =>
       throw s!"PyTorch graph import: {ctx}: unsupported value_kind `{other}`"
   | some bad => typeError s!"{ctx}.value_kind" "string" bad
@@ -273,7 +292,7 @@ attributes each constructor needs. We avoid trying to parse raw PyTorch operator
 names here; the Python adapter is responsible for translating `torch.ops.aten.*` / FX targets into
 these TorchLean tags.
 -/
-def parseOpKind (ctx : String) (outShape : Shape) (o : StateDict) : Except String OpKind := do
+def parseOpKind (env : DimEnv) (ctx : String) (outShape : Shape) (o : StateDict) : Except String OpKind := do
   let tagString ← jsonString s!"{ctx}.kind" (← field ctx "kind" o)
   let some tag := Wire.parseOpTag? tagString
     | throw s!"PyTorch graph import: {ctx}: unsupported TorchLean IR op kind `{tagString}`"
@@ -281,7 +300,7 @@ def parseOpKind (ctx : String) (outShape : Shape) (o : StateDict) : Except Strin
   | .const =>
       let valueShape ←
         match field? "value_shape" o with
-        | some j => parseShape s!"{ctx}.value_shape" j
+        | some j => parseShape env s!"{ctx}.value_shape" j
         | none => pure outShape
       pure (.const valueShape)
   | .permute => pure (.permute (← natArrayField ctx "perm" o))
@@ -291,7 +310,7 @@ def parseOpKind (ctx : String) (outShape : Shape) (o : StateDict) : Except Strin
   | .maxPool => pure (.maxPool (← windowConfig ctx o))
   | .avgPool => pure (.avgPool (← windowConfig ctx o))
   | .broadcastTo =>
-      pure (.broadcastTo (← shapeField ctx "from_shape" o) (← shapeField ctx "to_shape" o))
+      pure (.broadcastTo (← shapeField env ctx "from_shape" o) (← shapeField env ctx "to_shape" o))
   | .reduceSum | .reduceMean =>
       throw s!"PyTorch graph import: {ctx}: reduction must be lowered from its axes configuration"
   | .conv =>
@@ -313,8 +332,8 @@ def parseOpKind (ctx : String) (outShape : Shape) (o : StateDict) : Except Strin
   | .hardMaskedSoftmax =>
       throw s!"PyTorch graph import: {ctx}: `{tagString}` has no artifact encoding for its mask yet"
   | .layernorm => pure (.layernorm (← natField ctx "axis" o))
-  | .reshape => pure (.reshape (← shapeField ctx "in_shape" o) (← shapeField ctx "out_shape" o))
-  | .flatten => pure (.flatten (← shapeField ctx "value_shape" o))
+  | .reshape => pure (.reshape (← shapeField env ctx "in_shape" o) (← shapeField env ctx "out_shape" o))
+  | .flatten => pure (.flatten (← shapeField env ctx "value_shape" o))
   | .concat => pure (.concat (← natField ctx "axis" o))
   | .input | .detach | .add | .sub | .mulElem | .abs | .sqrt | .inv | .maxElem | .minElem | .sum
   | .matmul | .linear | .relu | .tanh | .sigmoid | .softplus | .safeLog
@@ -324,17 +343,17 @@ def parseOpKind (ctx : String) (outShape : Shape) (o : StateDict) : Except Strin
       | none => throw s!"PyTorch graph import: {ctx}: internal error: `{tagString}` needs a payload"
 
 /-- Parse one raw PyTorch/FX value node. -/
-def parseValueNode (j : Json) : Except String CapturedValueNode := do
+def parseValueNode (env : DimEnv) (j : Json) : Except String CapturedValueNode := do
   let o ← jsonObject "node" j
   let id ← natField "node" "id" o
   let ctx := s!"node[{id}]"
   let parents ← parseParents s!"{ctx}.parents" (← field ctx "parents" o)
   let kind ← jsonString s!"{ctx}.kind" (← field ctx "kind" o)
-  let valueShape ← parseValueShape ctx o
+  let valueShape ← parseValueShape env ctx o
   pure { id := id, parents := parents, kind := kind, valueShape := valueShape, raw := o }
 
 /-- Parse the graph object into the PyTorch/FX value-level graph, before tensor lowering. -/
-def parseValueGraph (j : Json) : Except String CapturedValueGraph := do
+def parseValueGraph (j : Json) (env : DimEnv := DimEnv.none) : Except String CapturedValueGraph := do
   let o ← jsonObject "root" j
   match field? "format" o with
   | some (.str format) =>
@@ -347,7 +366,7 @@ def parseValueGraph (j : Json) : Except String CapturedValueGraph := do
   if outputIds.isEmpty then
     throw "PyTorch graph import: root.output_ids must contain at least one output"
   let nodeVals ← jsonArray "root.nodes" (← field "root" "nodes" o)
-  let nodes ← nodeVals.mapM parseValueNode
+  let nodes ← nodeVals.mapM (parseValueNode env)
   pure { nodes := nodes, inputId := inputId, outputIds := outputIds }
 
 /-- Look up a raw value node by id. -/
@@ -401,7 +420,7 @@ Tuple/container nodes are preserved in `CapturedValueGraph`, but they do not bec
 TorchLean's verification and execution passes consume the clean tensor DAG, while the import layer
 can explain container-valued PyTorch failures without changing their semantics.
 -/
-def lowerValueGraph (vg : CapturedValueGraph) : Except String CapturedGraph := do
+def lowerValueGraph (vg : CapturedValueGraph) (env : DimEnv := DimEnv.none) : Except String CapturedGraph := do
   checkValueGraph vg
   let mut rawToTensor : Array (Option Nat) := Array.replicate vg.nodes.size none
   let mut tensorNodes : Array Node := #[]
@@ -616,7 +635,7 @@ def lowerValueGraph (vg : CapturedValueGraph) : Except String CapturedGraph := d
                   s!"PyTorch graph import: {ctx}: parent raw node {p} is not a tensor value " ++
                   "lowerable to NN.IR.Graph"
             | none => throw s!"PyTorch graph import: {ctx}: parent raw node {p} out of bounds"
-          let kind ← parseOpKind ctx outShape raw.raw
+          let kind ← parseOpKind env ctx outShape raw.raw
           let tensorId := tensorNodes.size
           tensorNodes := tensorNodes.push
             { id := tensorId, parents := parents, kind := kind, outShape := outShape }
@@ -639,8 +658,8 @@ def lowerValueGraph (vg : CapturedValueGraph) : Except String CapturedGraph := d
       mhaPayloadBindings := mhaPayloadBindings }
 
 /-- Parse the graph object and lower PyTorch/FX values to the tensor IR. -/
-def parseGraph (j : Json) : Except String CapturedGraph := do
-  lowerValueGraph (← parseValueGraph j)
+def parseGraph (j : Json) (env : DimEnv := DimEnv.none) : Except String CapturedGraph := do
+  lowerValueGraph (← parseValueGraph j env) env
 
 end Internal
 
@@ -654,8 +673,8 @@ Success means:
 - arities are valid, and
 - declared output shapes match `NN.IR.Infer`.
 -/
-def parseGraph (j : Json) : Except String CapturedGraph := do
-  match Internal.parseGraph j with
+def parseGraph (j : Json) (env : Internal.DimEnv := Internal.DimEnv.none) : Except String CapturedGraph := do
+  match Internal.parseGraph j env with
   | .error e => .error e
   | .ok cg =>
       match cg.graph.checkShapes with
@@ -806,9 +825,9 @@ Guarantee exposed by the parser: a successfully parsed graph is well-shaped.
 This theorem is compact but important. It is the theorem downstream verification/export code can
 quote when it receives a graph artifact through this importer.
 -/
-theorem parseGraph_wellShaped {j : Json} {cg : CapturedGraph}
-    (h : parseGraph j = .ok cg) : cg.graph.WellShaped := by
-  cases hparse : Internal.parseGraph j with
+theorem parseGraph_wellShaped {j : Json} {env : Internal.DimEnv} {cg : CapturedGraph}
+    (h : parseGraph j env = .ok cg) : cg.graph.WellShaped := by
+  cases hparse : Internal.parseGraph j env with
   | error e =>
       have hbad : Except.error e = Except.ok cg := by
         simp [parseGraph, hparse] at h
