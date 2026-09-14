@@ -83,11 +83,20 @@ def imports : Array String :=
 
 /-- Shape readers for FX node metadata plus the `getitem`/`getattr` target tests. -/
 def shapes : Array String :=
-  #[ "def _shape_of(value):"
+  #[ "_DIM_NAMES = {}      # sympy symbol of a symbolic size -> its name, set by the caller"
+   , ""
+   , "def _dim(x):"
+   , indent 4 "# A size is an int, or a symbolic size named in _DIM_NAMES; nothing else."
+   , indent 4 "if isinstance(x, torch.SymInt):"
+   , indent 8 "if x.node.expr in _DIM_NAMES: return _DIM_NAMES[x.node.expr]"
+   , indent 8 "raise NotImplementedError(f\"size {x} is not a named symbolic size\")"
+   , indent 4 "return int(x)"
+   , ""
+   , "def _shape_of(value):"
    , indent 4 "if hasattr(value, \"shape\"):"
-   , indent 8 "return [int(x) for x in tuple(value.shape)]"
+   , indent 8 "return [_dim(x) for x in tuple(value.shape)]"
    , indent 4 "if isinstance(value, (tuple, list)) and value and hasattr(value[0], \"shape\"):"
-   , indent 8 "return [int(x) for x in tuple(value[0].shape)]"
+   , indent 8 "return [_dim(x) for x in tuple(value[0].shape)]"
    , indent 4 "return []"
    , ""
    , "def _node_shape(node):"

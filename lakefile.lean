@@ -203,6 +203,10 @@ lean_exe torchlean where
 require floatlib from git
   "https://github.com/lean-dojo/FloatLib" @ "main"
 
+/-- Print the PyTorch graph-capture script (`lake exe export_bridge > export_torchlean_graph.py`). -/
+lean_exe export_bridge where
+  root := `ExportBridge
+
 -- Complete API documentation (HTML) via `scripts/lake.sh build TorchLeanDocs:docs`.
 require «doc-gen4» from git
   "https://github.com/leanprover/doc-gen4" @ "v4.34.0"
