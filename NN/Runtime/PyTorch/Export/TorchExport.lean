@@ -83,6 +83,7 @@ def bridgeImports : Array String :=
 def shapeHelpers : Array String :=
   #[ "_DIM_NAMES = {}      # sympy symbol -> declared dynamic dim name, set by _capture"
    , "_DIM_RANGES = {}     # dim name -> (min, max or None), set by _capture"
+   , "_LAST_CAPTURE = None # (FX graph, user input names) of the last JSON export"
    , ""
    , "def _dim(x):"
    , indentFour "# A size is an int, or the name of a dim declared dynamic at capture; nothing else."
@@ -801,7 +802,9 @@ def captureSection (options : GraphBridgeOptions) : Array String :=
 /-- The exported entry point: walk the captured graph and write the artifact. -/
 def exportFunctionSection (options : GraphBridgeOptions) : Array String :=
   #[ s!"def {options.functionName}(model, example, json_path: str, require_torch_export=False, dynamic_shapes=None):"
+   , indentFour "global _LAST_CAPTURE"
    , indentFour "graph, user_input_names = _capture(model, example, require_torch_export, dynamic_shapes)"
+   , indentFour "_LAST_CAPTURE = (graph, user_input_names)"
    , indentFour "nodes = []"
    , indentFour "node_to_id = {}"
    , indentFour "output_ids = None"
