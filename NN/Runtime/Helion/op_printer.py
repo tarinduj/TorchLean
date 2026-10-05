@@ -91,6 +91,8 @@ def print_op(kind: dict, args: list[str], shapes: list[list[str]]) -> tuple[str,
         if shapes[0] != shapes[1]:
             refuse("not implemented: add with broadcasting")
         return f"(Tensor.addSpec {args[0]} {args[1]})", set()
+    if kind == {"kind": "relu"}:
+        return f"(Activation.reluSpec {args[0]})", set()
     if kind == {"kind": "reduce_sum", "axes": [1], "keepdim": False} and len(shapes[0]) == 2:
         return f"(Tensor.reduceSum 1 {args[0]} (.succ (Shape.hasNonemptyAxisZeroOfPos h{shapes[0][1]}).proof))", {shapes[0][1]}
     refuse(f"not implemented: {kind}")
