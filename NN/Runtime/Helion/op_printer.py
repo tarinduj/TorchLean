@@ -7,6 +7,16 @@ SYM_OPS = ("sym_size.int", "sym_size")
 WIDTH = 100
 
 
+def input_name(i: int) -> str:
+    """Name the i-th input: x0, x1, …"""
+    return f"x{i}"
+
+
+def size_name(i: int) -> str:
+    """Name the i-th size: d0, d1, …"""
+    return f"d{i}"
+
+
 def refuse(msg: str):
     raise NotImplementedError(msg)
 
