@@ -63,10 +63,10 @@ def _assigned_names(statement) -> list[str] | None:
 class Emitter(op_printer.FxEmitter):
     """Check a captured Helion kernel and print its device IR as a Lean definition."""
 
-    def __init__(self, kernel, example: torch.Tensor, bridge, dim_names=("M", "N")):
+    def __init__(self, kernel, example: torch.Tensor, bridge):
         """Capture device IR and validate the input and host-code pattern.
 
-        Require symbolic sizes and one tensor argument of rank `len(dim_names)`.
+        Require symbolic sizes and one tensor argument, named by `op_printer.input_name` and `size_name`.
         The shared emitter replaces `bridge._DIM_NAMES` with this kernel's size-name map.
         """
         if kernel.settings.static_shapes:
@@ -81,17 +81,18 @@ class Emitter(op_printer.FxEmitter):
         self.helion_env = bound_kernel.env
         self.device_ir = self.host_function.device_ir
         params = [arg.arg for arg in self.host_function.definition.args.args]
-        if len(params) != 1 or example.dim() != len(dim_names):
-            refuse(f"kernel takes {params}; one rank-{len(dim_names)} tensor argument for now")
+        if len(params) != 1:
+            refuse(f"kernel takes {params}; one tensor argument for now")
         self.input_name = params[0]
-        self.dim_names = list(dim_names)
+        self.lean_input = op_printer.input_name(0)
+        self.dim_names = [op_printer.size_name(axis) for axis in range(example.dim())]
         sizes = list(bound_kernel.fake_args[0].shape)
         if not all(isinstance(size, torch.SymInt) for size in sizes):
             refuse(f"a size of {self.input_name} is static")
         self.block_ids = {
             block.var.node.expr: block.block_id for block in self.helion_env.block_sizes
         }
-        dimension_names = {size.node.expr: name for size, name in zip(sizes, dim_names)}
+        dimension_names = {size.node.expr: name for size, name in zip(sizes, self.dim_names)}
         block_names = {symbol: f"B{block_id}" for symbol, block_id in self.block_ids.items()}
         super().__init__(bridge, dimension_names | block_names)
         self.output_name = self._validate_host_and_find_output()
@@ -233,7 +234,7 @@ class Emitter(op_printer.FxEmitter):
         elif op == "_host_tensor":
             if args[0] not in (self.input_name, self.output_name):
                 refuse(f"host tensor {args[0]} is neither the argument nor the output")
-            values[ir_node] = "x" if args[0] == self.input_name else ("OUT",)
+            values[ir_node] = self.lean_input if args[0] == self.input_name else ("OUT",)
         elif op == "full":
             if args[1] != 0:
                 refuse(f"full with value {args[1]}; only zero accumulators for now")
@@ -260,7 +261,7 @@ class Emitter(op_printer.FxEmitter):
         elif op == "load":
             source, indices = args[0], args[1]
             if (
-                values[source] != "x"
+                values[source] != self.lean_input
                 or (len(args) > 2 and args[2] is not None)
                 or len(indices) != 2
             ):
@@ -270,7 +271,7 @@ class Emitter(op_printer.FxEmitter):
                 refuse("load index is not a tile of an enclosing loop")
             self._check_tile_extents([row_block, column_block], self.shape(source), "load")
             values[ir_node] = (
-                f"(loadTile B{row_block} B{column_block} 0 x "
+                f"(loadTile B{row_block} B{column_block} 0 {values[source]} "
                 f"tile{row_block} tile{column_block})"
             )
         elif op == "store":
@@ -356,17 +357,17 @@ class Emitter(op_printer.FxEmitter):
                 f"({' '.join(self.dim_names)} {block_parameters} : ℕ)",
                 *positivity_hypotheses,
                 f"(out0 : Tensor ℝ [{output_shape}])",
-                f"(x : Tensor ℝ [{', '.join(self.dim_names)}])",
+                f"({self.lean_input} : Tensor ℝ [{', '.join(self.dim_names)}])",
             ],
             f"Tensor ℝ [{output_shape}]",
         )
         self.output_shape = self.shape(output_node)
         docstring = _doc_comment(
-            f"Run the Helion `{self.fn_name}` kernel on `x`, writing into the output buffer `out0`."
+            f"Run the Helion `{self.fn_name}` kernel on `{self.lean_input}`, writing into the output buffer `out0`."
         )
         if any(len(line) > op_printer.WIDTH for line in docstring.splitlines()):
             docstring = _doc_comment(
-                "Run the Helion kernel on `x`, writing into the output buffer `out0`."
+                f"Run the Helion kernel on `{self.lean_input}`, writing into the output buffer `out0`."
             )
         return (
             f"-- Generated from {source} by NN/Runtime/Helion/helion_frontend.py; do not edit.\n"
