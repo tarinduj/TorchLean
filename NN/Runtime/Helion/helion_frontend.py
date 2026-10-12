@@ -97,6 +97,7 @@ class Emitter(op_printer.FxEmitter):
         super().__init__(bridge, dimension_names | block_names)
         self.output_name = self._validate_host_and_find_output()
         self.store_count = 0
+        self.in_bounds = []   # loop bound ≤ tensor size, for every load; trivial ones are omitted
 
     def _validate_host_and_find_output(self) -> str:
         """Check this host-code pattern and return the allocated output's name:
@@ -210,11 +211,7 @@ class Emitter(op_printer.FxEmitter):
         refuse(f"{value} is not a tile")
 
     def _check_tile_extents(self, blocks: list[int], dimensions: list[str], operation: str):
-        """Require each tile loop's extent to equal the size of the tensor axis it indexes.
-
-        For `x[tile_m, tile_n]` with shape `[M, N]`, the loop extents must be
-        exactly `[M, N]`. This also applies to stores.
-        """
+        """Require each store's tile loop extent to equal the size of the output axis it writes."""
         extents = [self.sym(self.helion_env.block_sizes[block].size) for block in blocks]
         if extents != dimensions:
             refuse(f"{operation} tiles axes of size {dimensions} with loops over {extents}")
@@ -264,15 +261,22 @@ class Emitter(op_printer.FxEmitter):
                 values[source] != self.lean_input
                 or (len(args) > 2 and args[2] is not None)
                 or len(indices) != 2
+                or len(self.shape(source)) != 2
             ):
                 refuse("load must read a whole 2-D tile of the argument without an extra mask")
             row_block, column_block = (self._block_id_of(index.meta["val"]) for index in indices)
             if not {row_block, column_block} <= context["tiles"]:
                 refuse("load index is not a tile of an enclosing loop")
-            self._check_tile_extents([row_block, column_block], self.shape(source), "load")
+            row_bound, column_bound = (
+                self.sym(self.helion_env.block_sizes[block].size) for block in (row_block, column_block)
+            )
+            # Helion masks the load by the loop bounds; every enabled lane must lie inside the tensor.
+            for bound, size in zip((row_bound, column_bound), self.shape(source)):
+                if bound != size and f"{bound} ≤ {size}" not in self.in_bounds:
+                    self.in_bounds.append(f"{bound} ≤ {size}")
             values[ir_node] = (
-                f"(loadTile B{row_block} B{column_block} 0 {values[source]} "
-                f"tile{row_block} tile{column_block})"
+                f"(loadTile2D {row_bound} {column_bound} B{row_block} B{column_block} 0 "
+                f"{values[source]} tile{row_block} tile{column_block})"
             )
         elif op == "store":
             destination, indices, value = args[0], args[1], args[2]
@@ -289,7 +293,7 @@ class Emitter(op_printer.FxEmitter):
             self._check_tile_extents([block_id], self.shape(destination), "store")
             self.store_count += 1
             context["state"] = (
-                f"(storeTile {context['state']} tile{block_id} {values[value]})"
+                f"(storeTile1D {context['state']} tile{block_id} {values[value]})"
             )
         else:
             refuse(f"unsupported op in device IR: {op}")

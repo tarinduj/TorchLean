@@ -30,16 +30,25 @@ def getOrFill {α : Type} [TorchLean.Storage α] {M N : ℕ}
   else
     fill
 
-/-- Return a `[B0, B1]` tensor. Its position `(i, j)` reads `x[tm * B0 + i, tn * B1 + j]`,
-or `fill` if that position is outside `x`. -/
-def loadTile {α : Type} [TorchLean.Storage α] {M N : ℕ}
-    (B0 B1 : ℕ) (fill : α) (x : Tensor α [M, N]) (tm tn : ℕ) : Tensor α [B0, B1] :=
+/-- Read `x[r, c]` when `(r, c)` is within the loop bounds `m, n`, and `fill` otherwise: Helion's
+load mask. Positions within the bounds but outside `x` also give `fill`. -/
+def maskedGet {α : Type} [TorchLean.Storage α] {M N : ℕ}
+    (m n : ℕ) (fill : α) (x : Tensor α [M, N]) (r c : ℕ) : α :=
+  if r < m ∧ c < n then
+    getOrFill fill x r c
+  else
+    fill
+
+/-- Return a `[B0, B1]` tensor. Its position `(i, j)` is `maskedGet m n fill x` at
+`(tm * B0 + i, tn * B1 + j)`, where `m, n` are the bounds of the loops that produce the tiles. -/
+def loadTile2D {α : Type} [TorchLean.Storage α] {M N : ℕ}
+    (m n B0 B1 : ℕ) (fill : α) (x : Tensor α [M, N]) (tm tn : ℕ) : Tensor α [B0, B1] :=
   Tensor.dim fun i => Tensor.dim fun j =>
-    Tensor.scalar (getOrFill fill x (tm * B0 + i) (tn * B1 + j))
+    Tensor.scalar (maskedGet m n fill x (tm * B0 + i) (tn * B1 + j))
 
 /-- Return a new tensor equal to `out`, except that row `tm * B0 + i` gets `v[i]` wherever
 that row exists in `out`. -/
-def storeTile {α : Type} [TorchLean.Storage α] {M B0 : ℕ}
+def storeTile1D {α : Type} [TorchLean.Storage α] {M B0 : ℕ}
     (out : Tensor α [M]) (tm : ℕ) (v : Tensor α [B0]) : Tensor α [M] :=
   Tensor.dim fun r =>
     let start := tm * B0
@@ -70,38 +79,42 @@ theorem le_numTiles_mul (n B : ℕ) (hB : 0 < B) : n ≤ numTiles n B * B := by
   generalize B * ((n + B - 1) / B) = p at *
   omega
 
-/-- At position `(i, j)`, `loadTile` returns `x[tm * B0 + i, tn * B1 + j]` when it exists,
-and `fill` otherwise. -/
-theorem get2_loadTile {α : Type} [TorchLean.Storage α] {M N : ℕ}
-    (B0 B1 : ℕ) (fill : α) (x : Tensor α [M, N]) (tm tn : ℕ) (i : Fin B0) (j : Fin B1) :
-    Spec.get2 (loadTile B0 B1 fill x tm tn) i j =
-      getOrFill fill x (tm * B0 + i) (tn * B1 + j) := by
-  simp [loadTile, Spec.get2, Spec.get]
+/-- At position `(i, j)`, `loadTile2D` returns `maskedGet` at `(tm * B0 + i, tn * B1 + j)`. -/
+theorem get2_loadTile2D {α : Type} [TorchLean.Storage α] {M N : ℕ}
+    (m n B0 B1 : ℕ) (fill : α) (x : Tensor α [M, N]) (tm tn : ℕ) (i : Fin B0) (j : Fin B1) :
+    Spec.get2 (loadTile2D m n B0 B1 fill x tm tn) i j =
+      maskedGet m n fill x (tm * B0 + i) (tn * B1 + j) := by
+  simp [loadTile2D, Spec.get2, Spec.get]
 
-/-- After `storeTile`, row `r` equals `v[r - tm * B0]` if tile `tm` covers it; otherwise
+/-- A lane outside the loop bounds reads `fill`. -/
+theorem maskedGet_masked {α : Type} [TorchLean.Storage α] {M N : ℕ}
+    (m n : ℕ) (fill : α) (x : Tensor α [M, N]) (r c : ℕ) (h : ¬(r < m ∧ c < n)) :
+    maskedGet m n fill x r c = fill := by
+  simp [maskedGet, h]
+
+/-- A lane within the loop bounds reads `x[r, c]`, when the bounds fit inside `x`. -/
+theorem maskedGet_enabled {α : Type} [TorchLean.Storage α] {M N : ℕ}
+    (m n : ℕ) (fill : α) (x : Tensor α [M, N]) (r c : ℕ) (hr : r < m) (hc : c < n)
+    (hm : m ≤ M) (hn : n ≤ N) :
+    maskedGet m n fill x r c = Spec.get2 x ⟨r, by omega⟩ ⟨c, by omega⟩ := by
+  simp [maskedGet, getOrFill, hr, hc, show r < M by omega, show c < N by omega]
+
+/-- When the mask bounds equal the tensor dimensions, `maskedGet` equals `getOrFill`. -/
+theorem maskedGet_eq_getOrFill {α : Type} [TorchLean.Storage α] {M N : ℕ}
+    (fill : α) (x : Tensor α [M, N]) (r c : ℕ) :
+    maskedGet M N fill x r c = getOrFill fill x r c := by
+  unfold maskedGet getOrFill
+  split_ifs <;> simp_all
+
+/-- After `storeTile1D`, row `r` equals `v[r - tm * B0]` if tile `tm` covers it; otherwise
 it still equals `out[r]`. -/
-theorem getScalar_storeTile {α : Type} [TorchLean.Storage α] {M B0 : ℕ}
+theorem getScalar_storeTile1D {α : Type} [TorchLean.Storage α] {M B0 : ℕ}
     (out : Tensor α [M]) (tm : ℕ) (v : Tensor α [B0]) (r : Fin M) :
-    Tensor.getScalar (storeTile out tm v) r =
+    Tensor.getScalar (storeTile1D out tm v) r =
       if h : tm * B0 ≤ r.val ∧ r.val < tm * B0 + B0 then
         Tensor.getScalar v ⟨r.val - tm * B0, by omega⟩
       else
         Tensor.getScalar out r := by
-  simp [storeTile]
-
-/-- Storing tile `tm` and then a different tile `tm'` gives the same result in reverse order. -/
-theorem storeTile_comm {α : Type} [TorchLean.Storage α] {M B0 : ℕ}
-    (out : Tensor α [M]) (tm tm' : ℕ) (h : tm ≠ tm') (v v' : Tensor α [B0]) :
-    storeTile (storeTile out tm v) tm' v' = storeTile (storeTile out tm' v') tm v := by
-  apply TorchLean.Tensor.Internal.Rep.ext
-  rintro ⟨r, _⟩
-  rw [← Tensor.getScalar_eq_apply, ← Tensor.getScalar_eq_apply]
-  simp only [getScalar_storeTile]
-  have hd : (tm + 1) * B0 ≤ tm' * B0 ∨ (tm' + 1) * B0 ≤ tm * B0 := by
-    rcases Nat.lt_or_gt_of_ne h with h | h
-    · exact .inl (Nat.mul_le_mul_right _ h)
-    · exact .inr (Nat.mul_le_mul_right _ h)
-  rw [Nat.succ_mul, Nat.succ_mul] at hd
-  split_ifs <;> first | rfl | omega
+  simp [storeTile1D]
 
 end TorchLean.Helion
