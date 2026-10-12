@@ -63,16 +63,16 @@ def _assigned_names(statement) -> list[str] | None:
 class Emitter(op_printer.FxEmitter):
     """Check a captured Helion kernel and print its device IR as a Lean definition."""
 
-    def __init__(self, kernel, example: torch.Tensor, bridge):
-        """Capture device IR and validate the input and host-code pattern.
+    def __init__(self, kernel, example_args: tuple, bridge):
+        """Capture device IR and validate the inputs and host-code pattern.
 
-        Require symbolic sizes and one tensor argument, named by `op_printer.input_name` and `size_name`.
+        Require tensor arguments with symbolic sizes, named by `op_printer.input_name` and `size_name`.
         The shared emitter replaces `bridge._DIM_NAMES` with this kernel's size-name map.
         """
         if kernel.settings.static_shapes:
             refuse("kernel must set static_shapes=False so sizes stay symbolic")
         try:
-            bound_kernel = kernel.bind((example,))
+            bound_kernel = kernel.bind(tuple(example_args))
         except Exception as error:
             first_line = str(error).splitlines()[0] if str(error) else ""
             refuse(f"Helion could not bind the kernel: {type(error).__name__}: {first_line}")
@@ -81,18 +81,22 @@ class Emitter(op_printer.FxEmitter):
         self.helion_env = bound_kernel.env
         self.device_ir = self.host_function.device_ir
         params = [arg.arg for arg in self.host_function.definition.args.args]
-        if len(params) != 1:
-            refuse(f"kernel takes {params}; one tensor argument for now")
-        self.input_name = params[0]
-        self.lean_input = op_printer.input_name(0)
-        self.dim_names = [op_printer.size_name(axis) for axis in range(example.dim())]
-        sizes = list(bound_kernel.fake_args[0].shape)
-        if not all(isinstance(size, torch.SymInt) for size in sizes):
-            refuse(f"a size of {self.input_name} is static")
+        if len(params) != len(example_args):
+            refuse(f"kernel takes {params}; tensor arguments only for now")
+        # Python argument name -> Lean input name, in signature order.
+        self.lean_inputs = {name: op_printer.input_name(i) for i, name in enumerate(params)}
+        # Name each size symbol by first appearance; sizes Helion shares between inputs share a name.
+        dimension_names, self.input_shapes = {}, {}
+        for name, fake in zip(params, bound_kernel.fake_args):
+            if not all(isinstance(size, torch.SymInt) for size in fake.shape):
+                refuse(f"a size of {name} is static")
+            for size in fake.shape:
+                dimension_names.setdefault(size.node.expr, op_printer.size_name(len(dimension_names)))
+            self.input_shapes[self.lean_inputs[name]] = [dimension_names[size.node.expr] for size in fake.shape]
+        self.dim_names = list(dimension_names.values())
         self.block_ids = {
             block.var.node.expr: block.block_id for block in self.helion_env.block_sizes
         }
-        dimension_names = {size.node.expr: name for size, name in zip(sizes, self.dim_names)}
         block_names = {symbol: f"B{block_id}" for symbol, block_id in self.block_ids.items()}
         super().__init__(bridge, dimension_names | block_names)
         self.output_name = self._validate_host_and_find_output()
@@ -123,7 +127,7 @@ class Emitter(op_printer.FxEmitter):
         ):
             refuse("host code must end with one grid loop followed by `return`")
         *prelude, grid_loop, return_statement = body
-        used_names = {self.input_name}
+        used_names = set(self.lean_inputs)
         size_names = set()
         output_name = None
         for statement in prelude:
@@ -150,7 +154,7 @@ class Emitter(op_printer.FxEmitter):
         if any(
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Store)
-            and node.id in (self.input_name, output_name)
+            and (node.id in self.lean_inputs or node.id == output_name)
             for node in ast.walk(grid_loop)
         ):
             refuse("the grid loop rebinds the argument or the output")
@@ -162,8 +166,8 @@ class Emitter(op_printer.FxEmitter):
         return output_name
 
     def _is_input_size_read(self, call) -> bool:
-        """Check `x.size()` or `x.size(<integer literal>)` in the host code."""
-        if not _is_attr(call.func, self.input_name, "size") or call.keywords:
+        """Check `x.size()` or `x.size(<integer literal>)` for an input `x` in the host code."""
+        if not any(_is_attr(call.func, name, "size") for name in self.lean_inputs) or call.keywords:
             return False
         if not call.args:
             return True
@@ -188,7 +192,7 @@ class Emitter(op_printer.FxEmitter):
             )
             and all(
                 keyword.arg in ("dtype", "device")
-                and _is_attr(keyword.value, self.input_name, keyword.arg)
+                and any(_is_attr(keyword.value, name, keyword.arg) for name in self.lean_inputs)
                 for keyword in call.keywords
             )
         )
@@ -229,9 +233,9 @@ class Emitter(op_printer.FxEmitter):
         elif op == "_new_var":
             values[ir_node] = values[args[0]]
         elif op == "_host_tensor":
-            if args[0] not in (self.input_name, self.output_name):
-                refuse(f"host tensor {args[0]} is neither the argument nor the output")
-            values[ir_node] = self.lean_input if args[0] == self.input_name else ("OUT",)
+            if args[0] not in self.lean_inputs and args[0] != self.output_name:
+                refuse(f"host tensor {args[0]} is neither an argument nor the output")
+            values[ir_node] = self.lean_inputs.get(args[0], ("OUT",))
         elif op == "full":
             if args[1] != 0:
                 refuse(f"full with value {args[1]}; only zero accumulators for now")
@@ -258,7 +262,7 @@ class Emitter(op_printer.FxEmitter):
         elif op == "load":
             source, indices = args[0], args[1]
             if (
-                values[source] != self.lean_input
+                values[source] not in self.input_shapes
                 or (len(args) > 2 and args[2] is not None)
                 or len(indices) != 2
                 or len(self.shape(source)) != 2
@@ -361,17 +365,18 @@ class Emitter(op_printer.FxEmitter):
                 f"({' '.join(self.dim_names)} {block_parameters} : ℕ)",
                 *positivity_hypotheses,
                 f"(out0 : Tensor ℝ [{output_shape}])",
-                f"({self.lean_input} : Tensor ℝ [{', '.join(self.dim_names)}])",
+                *(f"({name} : Tensor ℝ [{', '.join(shape)}])" for name, shape in self.input_shapes.items()),
             ],
             f"Tensor ℝ [{output_shape}]",
         )
         self.output_shape = self.shape(output_node)
+        inputs = ", ".join(f"`{name}`" for name in self.input_shapes)
         docstring = _doc_comment(
-            f"Run the Helion `{self.fn_name}` kernel on `{self.lean_input}`, writing into the output buffer `out0`."
+            f"Run the Helion `{self.fn_name}` kernel on {inputs}, writing into the output buffer `out0`."
         )
         if any(len(line) > op_printer.WIDTH for line in docstring.splitlines()):
             docstring = _doc_comment(
-                f"Run the Helion kernel on `{self.lean_input}`, writing into the output buffer `out0`."
+                f"Run the Helion kernel on {inputs}, writing into the output buffer `out0`."
             )
         return (
             f"-- Generated from {source} by NN/Runtime/Helion/helion_frontend.py; do not edit.\n"
