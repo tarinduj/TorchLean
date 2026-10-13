@@ -150,7 +150,7 @@ class Emitter(op_printer.FxEmitter):
             else:
                 refuse(f"host statement not in the supported pattern: {ast.unparse(statement)}")
         if not self._is_grid_iterator(grid_loop.iter, size_names):
-            refuse(f"grid loop must be `hl.tile(size)`: {ast.unparse(grid_loop.iter)}")
+            refuse(f"grid loop must be `hl.tile(size)` or `hl.tile([sizes])`: {ast.unparse(grid_loop.iter)}")
         if any(
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Store)
@@ -198,14 +198,18 @@ class Emitter(op_printer.FxEmitter):
         )
 
     def _is_grid_iterator(self, iterator, size_names: set[str]) -> bool:
-        """Accept `hl.tile(m)` in `for tile_m in hl.tile(m)` when `m` came from `x.size()`."""
-        return (
+        """Accept `hl.tile(m)` or `hl.tile([m, n])` when each size came from an input's `size()`."""
+        if not (
             isinstance(iterator, ast.Call)
             and _is_attr(iterator.func, "hl", "tile")
             and not iterator.keywords
             and len(iterator.args) == 1
-            and isinstance(iterator.args[0], ast.Name)
-            and iterator.args[0].id in size_names
+        ):
+            return False
+        argument = iterator.args[0]
+        sizes = argument.elts if isinstance(argument, (ast.List, ast.Tuple)) else [argument]
+        return bool(sizes) and all(
+            isinstance(size, ast.Name) and size.id in size_names for size in sizes
         )
 
     def _block_id_of(self, value) -> int:
@@ -289,19 +293,17 @@ class Emitter(op_printer.FxEmitter):
                 context["state"] is None
                 or values[destination] != ("OUT",)
                 or (len(args) > 3 and args[3] is not None)
-                or len(indices) != 1
-                or len(self.shape(destination)) != 1
             ):
-                refuse("store must write a 1-D output at the grid tile, in the grid body")
-            block_id = self._block_id_of(indices[0].meta["val"])
-            if block_id != self.grid_block:
-                refuse("store index is not the grid tile")
-            bounds = self._loop_bounds([block_id])
+                refuse("store must write the output at the grid tiles, in the grid body")
+            blocks = [self._block_id_of(index.meta["val"]) for index in indices]
+            if blocks != self.grid_blocks:
+                refuse("store indices are not the grid tiles, in order")
+            bounds = self._loop_bounds(blocks)
             self._record_in_bounds(bounds, self.shape(destination))
             self.store_count += 1
             context["state"] = (
-                f"(storeTile [B{block_id}] ![{bounds[0]}] {context['state']} ![tile{block_id}] "
-                f"{values[value]})"
+                f"(storeTile [{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}] "
+                f"{context['state']} ![{', '.join(f'tile{b}' for b in blocks)}] {values[value]})"
             )
         else:
             refuse(f"unsupported op in device IR: {op}")
@@ -343,14 +345,13 @@ class Emitter(op_printer.FxEmitter):
                 "device IR has alternative reduction-loop graphs chosen by config; "
                 "only the root graph is translated"
             )
-        if [len(blocks) for blocks in self.device_ir.grid_block_ids] != [1]:
-            refuse(f"grid {self.device_ir.grid_block_ids}; a 1-D grid for now")
-        grid_block = self.device_ir.grid_block_ids[0][0]
-        self.grid_block = grid_block
+        if len(self.device_ir.grid_block_ids) != 1:
+            refuse(f"grids {self.device_ir.grid_block_ids}; one grid for now")
+        self.grid_blocks = list(self.device_ir.grid_block_ids[0])
         if len(self.device_ir.root_ids) != 1:
             refuse(f"device IR has {len(self.device_ir.root_ids)} root graphs; expected one")
         root = self.device_ir.graphs[self.device_ir.root_ids[0]].graph
-        body = self.emit_graph(root, {}, {"tiles": {grid_block}, "state": "out", "lets": []})
+        body = self.emit_graph(root, {}, {"tiles": set(self.grid_blocks), "state": "out", "lets": []})
         if self.store_count != 1:
             refuse(f"expected one store into {self.output_name}, found {self.store_count}")
         output_node = next(
@@ -375,6 +376,13 @@ class Emitter(op_printer.FxEmitter):
         )
         self.output_shape = self.shape(output_node)
         inputs = ", ".join(f"`{name}`" for name in self.input_shapes)
+        # One `forTiles` per grid block, outermost first; each loop passes the output to the next.
+        grid_loops = "".join(
+            " " * (2 * depth + 2)
+            + f"forTiles {self.sym(self.helion_env.block_sizes[block].size)} B{block} "
+            + f"{'out0' if depth == 0 else 'out'} fun tile{block} out =>\n"
+            for depth, block in enumerate(self.grid_blocks)
+        )
         docstring = _doc_comment(
             f"Run the Helion `{self.fn_name}` kernel on {inputs}, writing into the output buffer `out0`."
         )
@@ -389,8 +397,7 @@ class Emitter(op_printer.FxEmitter):
             f"namespace {name}\n\n"
             f"{docstring}\n"
             f"{signature}\n"
-            f"  forTiles {self.sym(self.helion_env.block_sizes[grid_block].size)} "
-            f"B{grid_block} out0 fun tile{grid_block} out =>\n"
-            f"{op_printer.wrap_lines(_indent(body, 4))}\n\n"
+            f"{grid_loops}"
+            f"{op_printer.wrap_lines(_indent(body, 2 * len(self.grid_blocks) + 2))}\n\n"
             f"end {name}\n"
         )
