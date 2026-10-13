@@ -101,7 +101,7 @@ class Emitter(op_printer.FxEmitter):
         super().__init__(bridge, dimension_names | block_names)
         self.output_name = self._validate_host_and_find_output()
         self.store_count = 0
-        self.in_bounds = []   # loop bound ≤ tensor size, for every load; trivial ones are omitted
+        self.in_bounds = []   # loop bound ≤ tensor size, for every load and store; trivial ones omitted
 
     def _validate_host_and_find_output(self) -> str:
         """Check this host-code pattern and return the allocated output's name:
@@ -214,11 +214,17 @@ class Emitter(op_printer.FxEmitter):
             return self.block_ids[value.node.expr]
         refuse(f"{value} is not a tile")
 
-    def _check_tile_extents(self, blocks: list[int], dimensions: list[str], operation: str):
-        """Require each store's tile loop extent to equal the size of the output axis it writes."""
-        extents = [self.sym(self.helion_env.block_sizes[block].size) for block in blocks]
-        if extents != dimensions:
-            refuse(f"{operation} tiles axes of size {dimensions} with loops over {extents}")
+    def _loop_bounds(self, blocks: list[int]) -> list[str]:
+        """Return the sizes the loops of `blocks` run to: Helion's mask bounds for their tiles."""
+        return [self.sym(self.helion_env.block_sizes[block].size) for block in blocks]
+
+    def _record_in_bounds(self, bounds: list[str], dimensions: list[str]):
+        """Record that every masked-in lane lies inside the tensor: `bound ≤ size` on each axis."""
+        if len(bounds) != len(dimensions):
+            refuse(f"tile of rank {len(bounds)} on a tensor of rank {len(dimensions)}")
+        for bound, size in zip(bounds, dimensions, strict=True):
+            if bound != size and f"{bound} ≤ {size}" not in self.in_bounds:
+                self.in_bounds.append(f"{bound} ≤ {size}")
 
     def node(self, ir_node, values: dict, context: dict):
         """Translate a Helion-specific IR node into Lean.
@@ -271,16 +277,11 @@ class Emitter(op_printer.FxEmitter):
             row_block, column_block = (self._block_id_of(index.meta["val"]) for index in indices)
             if not {row_block, column_block} <= context["tiles"]:
                 refuse("load index is not a tile of an enclosing loop")
-            row_bound, column_bound = (
-                self.sym(self.helion_env.block_sizes[block].size) for block in (row_block, column_block)
-            )
-            # Helion masks the load by the loop bounds; every enabled lane must lie inside the tensor.
-            for bound, size in zip((row_bound, column_bound), self.shape(source)):
-                if bound != size and f"{bound} ≤ {size}" not in self.in_bounds:
-                    self.in_bounds.append(f"{bound} ≤ {size}")
+            bounds = self._loop_bounds([row_block, column_block])
+            self._record_in_bounds(bounds, self.shape(source))
             values[ir_node] = (
-                f"(loadTile2D {row_bound} {column_bound} B{row_block} B{column_block} 0 "
-                f"{values[source]} tile{row_block} tile{column_block})"
+                f"(loadTile [B{row_block}, B{column_block}] ![{', '.join(bounds)}] 0 "
+                f"{values[source]} ![tile{row_block}, tile{column_block}])"
             )
         elif op == "store":
             destination, indices, value = args[0], args[1], args[2]
@@ -289,15 +290,18 @@ class Emitter(op_printer.FxEmitter):
                 or values[destination] != ("OUT",)
                 or (len(args) > 3 and args[3] is not None)
                 or len(indices) != 1
+                or len(self.shape(destination)) != 1
             ):
-                refuse("store must write the output at the grid tile, in the grid body")
+                refuse("store must write a 1-D output at the grid tile, in the grid body")
             block_id = self._block_id_of(indices[0].meta["val"])
             if block_id != self.grid_block:
                 refuse("store index is not the grid tile")
-            self._check_tile_extents([block_id], self.shape(destination), "store")
+            bounds = self._loop_bounds([block_id])
+            self._record_in_bounds(bounds, self.shape(destination))
             self.store_count += 1
             context["state"] = (
-                f"(storeTile1D {context['state']} tile{block_id} {values[value]})"
+                f"(storeTile [B{block_id}] ![{bounds[0]}] {context['state']} ![tile{block_id}] "
+                f"{values[value]})"
             )
         else:
             refuse(f"unsupported op in device IR: {op}")

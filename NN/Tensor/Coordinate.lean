@@ -76,6 +76,12 @@ def Coord.toList : (shape : Shape) → shape.Coord → List Nat
   | .dim _ rest, coordinate =>
       coordinate.1.val :: Coord.toList rest coordinate.2
 
+/-- A coordinate's list has the same length as its shape. -/
+@[simp] theorem Coord.length_toList : ∀ (shape : Shape) (coordinate : shape.Coord),
+    (Coord.toList shape coordinate).length = shape.length
+  | .scalar, _ => rfl
+  | .dim _ rest, (_, coordinate) => by simp [Coord.toList, Coord.length_toList rest coordinate]
+
 /--
 Validate a runtime coordinate list against a static tensor shape.
 
