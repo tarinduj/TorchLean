@@ -102,6 +102,7 @@ class Emitter(op_printer.FxEmitter):
         self.output_name = self._validate_host_and_find_output()
         self.store_count = 0
         self.in_bounds = []   # loop bound ≤ tensor size, for every load and store; trivial ones omitted
+        self.full_slices = []  # axis size ≤ block size, for every full slice (`:`)
 
     def _validate_host_and_find_output(self) -> str:
         """Check this host-code pattern and return the allocated output's name:
@@ -230,6 +231,79 @@ class Emitter(op_printer.FxEmitter):
             if bound != size and f"{bound} ≤ {size}" not in self.in_bounds:
                 self.in_bounds.append(f"{bound} ≤ {size}")
 
+    def _tile_layout(self, ir_node) -> tuple[list[int], list[str], list[str]]:
+        """Find each tile axis's block ID, loop bound and tile index.
+
+        Record coverage requirements for full slices (`:`).
+        """
+        # Get each axis's block ID from the captured shape, since `:` has no tile variable.
+        blocks = [self._block_id_of(size) for size in ir_node.meta["val"].shape]
+        tiles = []
+        for block in blocks:
+            info = self.helion_env.block_sizes[block]
+            # Helion allocates the block of a full slice with `allocate_reduction_dimension`, which
+            # sets its `reduction` flag even when nothing is reduced over it.
+            if info.reduction:
+                # Represent the full slice (`:`) with one block starting at index 0.
+                # Require that block to cover the axis, e.g. `d1 ≤ B1`.
+                bound = self.sym(info.size)
+                if f"{bound} ≤ B{block}" not in self.full_slices:
+                    self.full_slices.append(f"{bound} ≤ B{block}")
+                tiles.append("0")
+            else:
+                tiles.append(f"tile{block}")
+        return blocks, self._loop_bounds(blocks), tiles
+
+    def _indexed_tile_layout(self, ir_node, indices, context: dict) -> tuple[list[int], list[str], list[str]]:
+        """Check that each index is an enclosing loop's tile or a full slice (`:`).
+
+        Return the block IDs, loop bounds and tile indices for the load or store.
+        """
+        blocks, bounds, tiles = self._tile_layout(ir_node)
+        if len(indices) != len(blocks):
+            refuse("indexing must give every axis a tile or `:`")
+        for index, block, tile_index in zip(indices, blocks, tiles):
+            if isinstance(index, slice):
+                # Only full slices (`:`) are supported; their block starts at tile index 0.
+                if index != slice(None) or tile_index != "0":
+                    refuse("a sliced axis must be a full slice `:`")
+            # A tile index must be the current tile of an enclosing loop over that axis's block.
+            elif (
+                not isinstance(index, torch.fx.Node)
+                or self._block_id_of(index.meta["val"]) != block
+                or block not in context["tiles"]
+            ):
+                refuse("index is not the tile of an enclosing loop for that axis")
+        return blocks, bounds, tiles
+
+    def aten(self, ir_node, values: dict) -> str:
+        """Translate masked `amax`; send other ATen ops to the shared printer."""
+        if op_printer.op_name(ir_node) != "amax.default":
+            return super().aten(ir_node, values)
+        operand = ir_node.args[0]
+        dims = ir_node.args[1] if len(ir_node.args) > 1 else ir_node.kwargs.get("dim", [])
+        keepdim = ir_node.args[2] if len(ir_node.args) > 2 else ir_node.kwargs.get("keepdim", False)
+        # Accept only an amax whose operand is `_mask_to(…, -inf)`: ℝ has no -inf, so the `_mask_to`
+        # and the `amax` become one `maskedMax`.
+        if (
+            not isinstance(operand, torch.fx.Node)
+            or op_printer.op_name(operand) != "_mask_to"
+            or operand.args[1] != float("-inf")
+        ):
+            refuse("amax requires an input masked to -inf")
+        rank = len(operand.meta["val"].shape)
+        if len(dims) != 1 or not -rank <= dims[0] < rank:
+            refuse("amax must reduce one valid axis")
+        axis = dims[0] % rank  # Convert negative axis numbering to nonnegative.
+        blocks, bounds, tiles = self._tile_layout(operand)
+        original = values[operand.args[0]]  # The tile before `_mask_to`; `maskedMax` skips its masked lanes.
+        call = (
+            f"(maskedMax [{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}] "
+            f"![{', '.join(tiles)}] {axis} {original})"
+        )
+        # Restore the singleton axis when keepdim=True.
+        return self.reshape(call, self.shape(ir_node)) if keepdim else call
+
     def node(self, ir_node, values: dict, context: dict):
         """Translate a Helion-specific IR node into Lean.
 
@@ -269,23 +343,32 @@ class Emitter(op_printer.FxEmitter):
             name = f"acc{block_id}"
             context["lets"].append(f"let {name} := {op_printer.unparen(values[args[1]])}")
             values[ir_node] = name
+        elif op == "_mask_to":
+            if args[1] == float("-inf"):
+                users = list(ir_node.users)
+                if len(users) != 1 or op_printer.op_name(users[0]) != "amax.default":
+                    refuse("_mask_to(-inf) is supported only as the input of amax")
+                values[ir_node] = None   # printed by its amax
+            elif args[1] == 0:
+                blocks, bounds, tiles = self._tile_layout(ir_node)
+                values[ir_node] = (
+                    f"(maskTo [{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}] "
+                    f"![{', '.join(tiles)}] 0 {values[args[0]]})"
+                )
+            else:
+                refuse(f"_mask_to with fill {args[1]}; only 0 and -inf for now")
         elif op == "load":
             source, indices = args[0], args[1]
             if (
                 values[source] not in self.input_shapes
                 or (len(args) > 2 and args[2] is not None)
-                or len(indices) != 2
-                or len(self.shape(source)) != 2
             ):
-                refuse("load must read a whole 2-D tile of the argument without an extra mask")
-            row_block, column_block = (self._block_id_of(index.meta["val"]) for index in indices)
-            if not {row_block, column_block} <= context["tiles"]:
-                refuse("load index is not a tile of an enclosing loop")
-            bounds = self._loop_bounds([row_block, column_block])
+                refuse("load must read a tile of an argument without an extra mask")
+            blocks, bounds, tiles = self._indexed_tile_layout(ir_node, indices, context)
             self._record_in_bounds(bounds, self.shape(source))
             values[ir_node] = (
-                f"(loadTile [B{row_block}, B{column_block}] ![{', '.join(bounds)}] 0 "
-                f"{values[source]} ![tile{row_block}, tile{column_block}])"
+                f"(loadTile [{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}] 0 "
+                f"{values[source]} ![{', '.join(tiles)}])"
             )
         elif op == "store":
             destination, indices, value = args[0], args[1], args[2]
@@ -295,15 +378,14 @@ class Emitter(op_printer.FxEmitter):
                 or (len(args) > 3 and args[3] is not None)
             ):
                 refuse("store must write the output at the grid tiles, in the grid body")
-            blocks = [self._block_id_of(index.meta["val"]) for index in indices]
-            if blocks != self.grid_blocks:
-                refuse("store indices are not the grid tiles, in order")
-            bounds = self._loop_bounds(blocks)
+            blocks, bounds, tiles = self._indexed_tile_layout(value, indices, context)
+            if [b for b, t in zip(blocks, tiles) if t != "0"] != self.grid_blocks:
+                refuse("store indices are not the grid tiles, in order, and full slices")
             self._record_in_bounds(bounds, self.shape(destination))
             self.store_count += 1
             context["state"] = (
                 f"(storeTile [{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}] "
-                f"{context['state']} ![{', '.join(f'tile{b}' for b in blocks)}] {values[value]})"
+                f"{context['state']} ![{', '.join(tiles)}] {values[value]})"
             )
         else:
             refuse(f"unsupported op in device IR: {op}")
@@ -340,11 +422,6 @@ class Emitter(op_printer.FxEmitter):
 
     def emit(self, name: str, source: str) -> str:
         """Emit the complete Lean module for the outer `hl.tile` grid loop and its body."""
-        if any(type(graph).__name__ == "ReductionLoopGraphInfo" for graph in self.device_ir.graphs):
-            refuse(
-                "device IR has alternative reduction-loop graphs chosen by config; "
-                "only the root graph is translated"
-            )
         if len(self.device_ir.grid_block_ids) != 1:
             refuse(f"grids {self.device_ir.grid_block_ids}; one grid for now")
         self.grid_blocks = list(self.device_ir.grid_block_ids[0])
@@ -352,6 +429,14 @@ class Emitter(op_printer.FxEmitter):
             refuse(f"device IR has {len(self.device_ir.root_ids)} root graphs; expected one")
         root = self.device_ir.graphs[self.device_ir.root_ids[0]].graph
         body = self.emit_graph(root, {}, {"tiles": set(self.grid_blocks), "state": "out", "lets": []})
+        # Only the root graph, where each full slice is one block, is translated. Helion runs it
+        # for configs whose `reduction_loops` entries are `None`; other configs run the
+        # reduction-loop graphs, which split full slices into chunks.
+        if (
+            any(type(graph).__name__ == "ReductionLoopGraphInfo" for graph in self.device_ir.graphs)
+            and not self.full_slices
+        ):
+            refuse("device IR has reduction-loop graphs but the root graph has no full slice")
         if self.store_count != 1:
             refuse(f"expected one store into {self.output_name}, found {self.store_count}")
         output_node = next(
@@ -383,12 +468,14 @@ class Emitter(op_printer.FxEmitter):
             + f"{'out0' if depth == 0 else 'out'} fun tile{block} out =>\n"
             for depth, block in enumerate(self.grid_blocks)
         )
+        # With full slices, Helion also has reduction-loop graphs that other configs run.
+        scope = " This is Helion's root device IR, run by configs without reduction loops." if self.full_slices else ""
         docstring = _doc_comment(
-            f"Run the Helion `{self.fn_name}` kernel on {inputs}, writing into the output buffer `out0`."
+            f"Run the Helion `{self.fn_name}` kernel on {inputs}, writing into the output buffer `out0`.{scope}"
         )
         if any(len(line) > op_printer.WIDTH for line in docstring.splitlines()):
             docstring = _doc_comment(
-                f"Run the Helion kernel on {inputs}, writing into the output buffer `out0`."
+                f"Run the Helion kernel on {inputs}, writing into the output buffer `out0`.{scope}"
             )
         return (
             f"-- Generated from {source} by NN/Runtime/Helion/helion_frontend.py; do not edit.\n"

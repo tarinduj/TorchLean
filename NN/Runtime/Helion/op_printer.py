@@ -17,6 +17,13 @@ def size_name(i: int) -> str:
     return f"d{i}"
 
 
+# The bridge targets TorchLean's graph IR, which has no division operator.
+# Our direct translation supports tensor division through `Tensor.divSpec`.
+_DIRECT_ONLY_KINDS = {"div.Tensor": {"kind": "div"}}
+# Broadcast these operations' operands to the captured output shape.
+_BINARY_ELEMENTWISE_KINDS = ("add", "sub", "div")
+
+
 def refuse(msg: str):
     raise NotImplementedError(msg)
 
@@ -74,12 +81,18 @@ def wrap_expr(expr: str, indent: int) -> list[str]:
 
 
 def wrap_lines(text: str) -> str:
-    """Wrap each over-long plain application line of `text`; leave binding lines unchanged."""
+    """Wrap each over-long application line of `text`, and the value of an over-long `let`; leave
+    other binding lines unchanged."""
     out = []
     for ln in text.splitlines():
         body = ln.lstrip()
-        binding = any(t in f" {body} " for t in (" let ", " fun ", " := ", " => "))
-        out += [ln] if len(ln) <= WIDTH or binding else wrap_expr(body, len(ln) - len(body))
+        indent = len(ln) - len(body)
+        head, sep, value = body.partition(" := ")
+        if len(ln) > WIDTH and body.startswith("let ") and sep and " " not in head[4:]:
+            out += [" " * indent + head + " :="] + wrap_expr(unparen(value), indent + 2)
+            continue
+        binding = any(t in ("let", "fun", ":=", "=>") for t in _split_top(body))
+        out += [ln] if len(ln) <= WIDTH or binding else wrap_expr(body, indent)
     return "\n".join(out)
 
 
@@ -97,12 +110,18 @@ def print_def(head: str, binders: list[str], result: str) -> str:
 
 def print_op(kind: dict, args: list[str], shapes: list[list[str]]) -> tuple[str, set[str]]:
     """Print one normalized op and return the dimensions it requires to be positive."""
-    if kind == {"kind": "add"}:
+    if kind in ({"kind": "add"}, {"kind": "sub"}, {"kind": "div"}):
+        if len(args) != 2:
+            refuse(f"not implemented: {kind['kind']} with a scalar operand")
         if shapes[0] != shapes[1]:
-            refuse("not implemented: add with broadcasting")
-        return f"(Tensor.addSpec {args[0]} {args[1]})", set()
+            refuse(f"not implemented: {kind['kind']} with broadcasting")
+        return f"(Tensor.{kind['kind']}Spec {args[0]} {args[1]})", set()
     if kind == {"kind": "relu"}:
         return f"(Activation.reluSpec {args[0]})", set()
+    if kind == {"kind": "exp"}:
+        return f"(Tensor.expSpec {args[0]})", set()
+    if kind == {"kind": "softmax", "axis": 1} and len(shapes[0]) == 2:
+        return f"(Activation.softmaxSpec 1 {args[0]})", set()
     if kind == {"kind": "reduce_sum", "axes": [1], "keepdim": False} and len(shapes[0]) == 2:
         return f"(Tensor.reduceSum 1 {args[0]} (.succ (Shape.hasNonemptyAxisZeroOfPos h{shapes[0][1]}).proof))", {shapes[0][1]}
     refuse(f"not implemented: {kind}")
@@ -123,15 +142,45 @@ class FxEmitter:
         refuse(f"size {v} is not a named size")
 
     def shape(self, node) -> list[str]:
-        """Read a node's tensor shape as Lean dimension names."""
-        return [self.sym(s) for s in node.meta["val"].shape]
+        """Read a node's tensor shape as Lean dimension names, or `1` for a singleton axis."""
+        return ["1" if isinstance(s, int) and s == 1 else self.sym(s) for s in node.meta["val"].shape]
 
     def aten(self, n, env) -> str:
-        """Lower an ATen node with the bridge, then print its TorchLean tensor call."""
+        """Lower an ATen node with the bridge, then print its TorchLean tensor call.
+
+        Each value keeps its captured shape: an elementwise operand is broadcast to the node's
+        shape, and a `keepdim` reduction is reshaped to it.
+        """
         operands = self.bridge._node_refs((n.args, n.kwargs), {m: m for m in n.all_input_nodes})
-        call, positive = print_op(self.bridge._lower_kind(n), [env[p] for p in operands], [self.shape(p) for p in operands])
+        if op_name(n) in _DIRECT_ONLY_KINDS:
+            kind = _DIRECT_ONLY_KINDS[op_name(n)]
+        else:
+            kind = self.bridge._lower_kind(n)
+        if kind["kind"] in _BINARY_ELEMENTWISE_KINDS:
+            target = self.shape(n)
+            args = [self.broadcast(env[p], self.shape(p), target) for p in operands]
+            shapes = [target] * len(operands)
+        else:
+            args, shapes = [env[p] for p in operands], [self.shape(p) for p in operands]
+        # TorchLean reductions drop the axis; reshape below restores it for keepdim=True.
+        keepdim = bool(kind.get("keepdim"))
+        if keepdim:
+            kind = {**kind, "keepdim": False}
+        call, positive = print_op(kind, args, shapes)
         self.hyps |= positive
-        return call
+        return self.reshape(call, self.shape(n)) if keepdim else call
+
+    def broadcast(self, value: str, shape: list[str], target: list[str]) -> str:
+        """Broadcast `value` between equal-rank shapes; each axis of `shape` must match `target` or be `1`."""
+        if shape == target:
+            return value
+        if len(shape) != len(target) or any(s not in (t, "1") for s, t in zip(shape, target)):
+            refuse(f"cannot broadcast {shape} to {target}")
+        return f"(Tensor.broadcastTo (s₂ := [{', '.join(target)}]) (by simp [Shape.CanBroadcastTo]) {value})"
+
+    def reshape(self, value: str, target: list[str]) -> str:
+        """Reshape `value` to `target`, e.g. a reduction's result to its `keepdim` shape."""
+        return f"(Tensor.reshapeSpec (target := [{', '.join(target)}]) {value} (by simp [Shape.size]))"
 
     def node(self, n, env: dict, ctx: dict):
         """Refuse non-ATen nodes unless a subclass supplies their translation."""

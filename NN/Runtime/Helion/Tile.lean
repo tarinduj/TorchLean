@@ -83,4 +83,27 @@ def storeTile {s : Shape} (blockSizes : List ℕ) (bounds : Fin blockSizes.lengt
     else
       out c
 
+/-- Set the entries of tile `tileIdx` that lie outside the mask of `bounds` to `fill`: Helion's
+`_mask_to(v, fill)` for a finite `fill`. -/
+def maskTo (blockSizes : List ℕ) (bounds tileIdx : Fin blockSizes.length → ℕ) (fill : α)
+    (v : Tensor α blockSizes) : Tensor α blockSizes :=
+  TorchLean.Tensor.Internal.Rep.ofFn fun c =>
+    if InMask bounds (globalIndex blockSizes tileIdx (coordAt c)) then
+      v c
+    else
+      fill
+
+/-- The largest entry along `axis` among those inside the mask of `bounds`: Helion's `amax` along
+`axis` after `_mask_to(v, -inf)`. Where no entry along `axis` is inside the mask, this gives `0`
+and Helion gives `-inf`. -/
+def maskedMax [Max α] [Zero α] (blockSizes : List ℕ) (bounds tileIdx : Fin blockSizes.length → ℕ)
+    (axis : Fin blockSizes.length) (v : Tensor α blockSizes) :
+    Tensor α (Shape.eraseAxis blockSizes axis) :=
+  TorchLean.Tensor.Internal.Rep.ofFn fun c =>
+    let lane (j : ℕ) : List ℕ := (Shape.Coord.toList _ c).insertIdx axis j
+    let inMask (j : ℕ) := InMask bounds (globalIndex blockSizes tileIdx fun k => (lane j).getD k 0)
+    let entries := ((List.range (blockSizes.get axis)).filter inMask).map fun j =>
+      getOrFill 0 v (lane j)
+    entries.max?.getD 0
+
 end TorchLean.Helion
