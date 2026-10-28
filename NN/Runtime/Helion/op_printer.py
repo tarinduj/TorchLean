@@ -20,8 +20,8 @@ def size_name(i: int) -> str:
 # The bridge targets TorchLean's graph IR, which has no division operator.
 # Our direct translation supports tensor division through `Tensor.divSpec`.
 _DIRECT_ONLY_KINDS = {"div.Tensor": {"kind": "div"}}
-# Broadcast these operations' operands to the captured output shape.
-_BINARY_ELEMENTWISE_KINDS = ("add", "sub", "div")
+# Binary elementwise kinds and their TorchLean ops; operands are broadcast to the output shape.
+_BINARY_ELEMENTWISE_KINDS = {"add": "addSpec", "sub": "subSpec", "mul_elem": "mulSpec", "div": "divSpec"}
 
 
 def refuse(msg: str):
@@ -110,12 +110,12 @@ def print_def(head: str, binders: list[str], result: str) -> str:
 
 def print_op(kind: dict, args: list[str], shapes: list[list[str]]) -> tuple[str, set[str]]:
     """Print one normalized op and return the dimensions it requires to be positive."""
-    if kind in ({"kind": "add"}, {"kind": "sub"}, {"kind": "div"}):
+    if kind["kind"] in _BINARY_ELEMENTWISE_KINDS and len(kind) == 1:
         if len(args) != 2:
             refuse(f"not implemented: {kind['kind']} with a scalar operand")
         if shapes[0] != shapes[1]:
             refuse(f"not implemented: {kind['kind']} with broadcasting")
-        return f"(Tensor.{kind['kind']}Spec {args[0]} {args[1]})", set()
+        return f"(Tensor.{_BINARY_ELEMENTWISE_KINDS[kind['kind']]} {args[0]} {args[1]})", set()
     if kind == {"kind": "relu"}:
         return f"(Activation.reluSpec {args[0]})", set()
     if kind == {"kind": "exp"}:
