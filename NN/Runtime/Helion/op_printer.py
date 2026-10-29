@@ -113,8 +113,6 @@ def print_op(kind: dict, args: list[str], shapes: list[list[str]]) -> tuple[str,
     if kind["kind"] in _BINARY_ELEMENTWISE_KINDS and len(kind) == 1:
         if len(args) != 2:
             refuse(f"not implemented: {kind['kind']} with a scalar operand")
-        if shapes[0] != shapes[1]:
-            refuse(f"not implemented: {kind['kind']} with broadcasting")
         return f"(Tensor.{_BINARY_ELEMENTWISE_KINDS[kind['kind']]} {args[0]} {args[1]})", set()
     if kind == {"kind": "relu"}:
         return f"(Activation.reluSpec {args[0]})", set()

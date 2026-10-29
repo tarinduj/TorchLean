@@ -21,6 +21,11 @@ def _indent(text: str, spaces: int) -> str:
     return "\n".join(" " * spaces + line for line in text.splitlines())
 
 
+def _tile_args(blocks: list[int], bounds: list[str]) -> str:
+    """Print a tile's block sizes and loop bounds, the first arguments of the tile ops: `[B0, B1] ![d0, d1]`."""
+    return f"[{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}]"
+
+
 def _doc_comment(text: str) -> str:
     """Lay out `text` as a Lean doc comment whose lines fit in the printer's width."""
     lines = textwrap.wrap(
@@ -297,10 +302,7 @@ class Emitter(op_printer.FxEmitter):
         axis = dims[0] % rank  # Convert negative axis numbering to nonnegative.
         blocks, bounds, tiles = self._tile_layout(operand)
         original = values[operand.args[0]]  # The tile before `_mask_to`; `maskedMax` skips its masked lanes.
-        call = (
-            f"(maskedMax [{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}] "
-            f"![{', '.join(tiles)}] {axis} {original})"
-        )
+        call = f"(maskedMax {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] {axis} {original})"
         # Restore the singleton axis when keepdim=True.
         return self.reshape(call, self.shape(ir_node)) if keepdim else call
 
@@ -351,10 +353,7 @@ class Emitter(op_printer.FxEmitter):
                 values[ir_node] = None   # printed by its amax
             elif args[1] == 0:
                 blocks, bounds, tiles = self._tile_layout(ir_node)
-                values[ir_node] = (
-                    f"(maskTo [{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}] "
-                    f"![{', '.join(tiles)}] 0 {values[args[0]]})"
-                )
+                values[ir_node] = f"(maskTo {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] 0 {values[args[0]]})"
             else:
                 refuse(f"_mask_to with fill {args[1]}; only 0 and -inf for now")
         elif op == "load":
@@ -366,10 +365,7 @@ class Emitter(op_printer.FxEmitter):
                 refuse("load must read a tile of an argument without an extra mask")
             blocks, bounds, tiles = self._indexed_tile_layout(ir_node, indices, context)
             self._record_in_bounds(bounds, self.shape(source))
-            values[ir_node] = (
-                f"(loadTile [{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}] 0 "
-                f"{values[source]} ![{', '.join(tiles)}])"
-            )
+            values[ir_node] = f"(loadTile {_tile_args(blocks, bounds)} 0 {values[source]} ![{', '.join(tiles)}])"
         elif op == "store":
             destination, indices, value = args[0], args[1], args[2]
             if (
@@ -381,11 +377,11 @@ class Emitter(op_printer.FxEmitter):
             blocks, bounds, tiles = self._indexed_tile_layout(value, indices, context)
             if [b for b, t in zip(blocks, tiles) if t != "0"] != self.grid_blocks:
                 refuse("store indices are not the grid tiles, in order, and full slices")
-            self._record_in_bounds(bounds, self.shape(destination))
+            self.output_shape = self.shape(destination)
+            self._record_in_bounds(bounds, self.output_shape)
             self.store_count += 1
             context["state"] = (
-                f"(storeTile [{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}] "
-                f"{context['state']} ![{', '.join(tiles)}] {values[value]})"
+                f"(storeTile {_tile_args(blocks, bounds)} {context['state']} ![{', '.join(tiles)}] {values[value]})"
             )
         else:
             refuse(f"unsupported op in device IR: {op}")
@@ -406,7 +402,7 @@ class Emitter(op_printer.FxEmitter):
         if extent not in self.dim_names:
             refuse(f"inner loop runs to {extent}, not an input size")
         accumulator = f"acc{block_id}"
-        placeholders = [node for node in loop_graph.graph.nodes if node.op == "placeholder"]
+        placeholders = loop_graph.graph.find_nodes(op="placeholder")
         if len(placeholders) != 1:
             refuse("inner loop body must read only its carried value from outside")
         placeholder = placeholders[0]
@@ -439,12 +435,7 @@ class Emitter(op_printer.FxEmitter):
             refuse("device IR has reduction-loop graphs but the root graph has no full slice")
         if self.store_count != 1:
             refuse(f"expected one store into {self.output_name}, found {self.store_count}")
-        output_node = next(
-            node
-            for node in root.nodes
-            if op_printer.op_name(node) == "_host_tensor" and node.args[0] == self.output_name
-        )
-        output_shape = ", ".join(self.shape(output_node))
+        output_shape = ", ".join(self.output_shape)
         block_parameters = " ".join(f"B{block}" for block in sorted(self.block_ids.values()))
         positivity_hypotheses = [
             f"(h{dimension} : 0 < {dimension})" for dimension in sorted(self.hyps)
@@ -459,7 +450,6 @@ class Emitter(op_printer.FxEmitter):
             ],
             f"Tensor ℝ [{output_shape}]",
         )
-        self.output_shape = self.shape(output_node)
         inputs = ", ".join(f"`{name}`" for name in self.input_shapes)
         # One `forTiles` per grid block, outermost first; each loop passes the output to the next.
         grid_loops = "".join(
