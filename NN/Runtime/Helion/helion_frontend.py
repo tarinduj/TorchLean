@@ -279,7 +279,7 @@ class Emitter(op_printer.FxEmitter):
             elif not isinstance(index, torch.fx.Node):
                 refuse("only tiles and `:` are supported as indices")
             # A tile index must be the current tile of an enclosing loop over that axis's block.
-            elif self._block_id_of(index.meta["val"]) != block or block not in context["tiles"]:
+            elif self._block_id_of(index.meta["val"]) != block or block not in context["nest"]:
                 invalid("index is not the tile of an enclosing loop for that axis")
         return blocks, bounds, tiles
 
@@ -331,7 +331,7 @@ class Emitter(op_printer.FxEmitter):
                 refuse("only zero accumulators are supported")
             values[ir_node] = f"(Tensor.zeros [{', '.join(self.shape(ir_node))}])"
         elif op == "_for_loop":
-            values[ir_node] = self._emit_inner_loop(ir_node, values, context["tiles"])
+            self._emit_inner_loop(ir_node, values, context)
         elif op == "getitem":
             if args[1] != 0:
                 refuse("only loops with one result are supported")
@@ -372,14 +372,14 @@ class Emitter(op_printer.FxEmitter):
         elif op == "store":
             destination, indices, value = args[0], args[1], args[2]
             if context["state"] is None:
-                refuse("only stores in the grid body are supported")
+                refuse("only stores outside loops that carry a value are supported")
             if values[destination] != ("OUT",):
                 refuse("only stores into the output are supported")
             if len(args) > 3 and args[3] is not None:
                 refuse("only stores without an extra mask are supported")
             blocks, bounds, tiles = self._indexed_tile_layout(value, indices, context)
-            if [b for b, t in zip(blocks, tiles) if t != "0"] != self.grid_blocks:
-                refuse("only stores at the grid tiles, in order, are supported")
+            if [b for b, t in zip(blocks, tiles) if t != "0"] != context["nest"]:
+                refuse("only stores at the enclosing loops' tiles, in order, are supported")
             self.output_shape = self.shape(destination)
             self._record_in_bounds(bounds, self.output_shape)
             self.store_count += 1
@@ -389,34 +389,45 @@ class Emitter(op_printer.FxEmitter):
         else:
             refuse(f"device op {op} is not supported")
 
-    def _emit_inner_loop(self, ir_node, values: dict, enclosing_tiles: set[int]) -> str:
-        """Emit a Lean `forTiles` expression for an inner `hl.tile` loop that updates one value."""
+    def _emit_inner_loop(self, ir_node, values: dict, context: dict):
+        """Emit an inner `hl.tile` loop as `forTiles`."""
         graph_id, begin, end, initial_values = ir_node.args[:4]
         loop_graph = self.device_ir.graphs[graph_id]
         if len(loop_graph.block_ids) != 1 or len(end) != 1:
             refuse("only inner loops over one axis are supported")
         if list(begin) != [0]:
             refuse("only inner loops from 0 are supported")
-        if len(initial_values) != 1:
-            refuse("only inner loops carrying one value are supported")
+        if len(initial_values) > 1:
+            refuse("only inner loops carrying at most one value are supported")
         (block_id,) = loop_graph.block_ids
         extent = self.sym(end[0].meta["val"])
         if extent not in self.dim_names:
             refuse("only inner loops up to an input size are supported")
-        accumulator = f"acc{block_id}"
         placeholders = loop_graph.graph.find_nodes(op="placeholder")
         if len(placeholders) != len(initial_values):
             invalid(f"inner loop body has {len(placeholders)} inputs but the loop passes {len(initial_values)}")
-        placeholder = placeholders[0]
-        body = self.emit_graph(
-            loop_graph.graph,
-            {**values, placeholder: accumulator},
-            {"tiles": enclosing_tiles | {block_id}, "state": None, "lets": []},
-        )
-        return (
-            f"(forTiles {extent} B{block_id} {values[initial_values[0]]} "
-            f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)})"
-        )
+        nest = context["nest"] + [block_id]
+        if not initial_values:
+            # A storing loop: each iteration writes into the output.
+            if context["state"] is None:
+                refuse("only storing loops outside loops that carry a value are supported")
+            body = self.emit_graph(loop_graph.graph, dict(values), {"nest": nest, "state": "out", "lets": []})
+            context["state"] = (
+                f"(forTiles {extent} B{block_id} {context['state']} fun tile{block_id} out =>\n"
+                f"{_indent(body, 2)})"
+            )
+        else:
+            # A carrying loop: each iteration updates one value, such as an accumulator.
+            accumulator = f"acc{block_id}"
+            body = self.emit_graph(
+                loop_graph.graph,
+                {**values, placeholders[0]: accumulator},
+                {"nest": nest, "state": None, "lets": []},
+            )
+            values[ir_node] = (
+                f"(forTiles {extent} B{block_id} {values[initial_values[0]]} "
+                f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)})"
+            )
 
     def emit(self, name: str, source: str) -> str:
         """Emit the complete Lean module for the outer `hl.tile` grid loop and its body."""
@@ -426,7 +437,7 @@ class Emitter(op_printer.FxEmitter):
         if len(self.device_ir.root_ids) != 1:
             refuse("only one root graph is supported")
         root = self.device_ir.graphs[self.device_ir.root_ids[0]].graph
-        body = self.emit_graph(root, {}, {"tiles": set(self.grid_blocks), "state": "out", "lets": []})
+        body = self.emit_graph(root, {}, {"nest": list(self.grid_blocks), "state": "out", "lets": []})
         # Only the root graph, where each full slice is one block, is translated. Helion runs it
         # for configs whose `reduction_loops` entries are `None`; other configs run the
         # reduction-loop graphs, which split full slices into chunks.

@@ -200,7 +200,7 @@ class FxEmitter:
                 continue
             if n.op == "output":
                 outs = n.args[0]
-                if outs is not None:
+                if outs is not None and len(outs) > 0:
                     if not (isinstance(outs, (list, tuple)) and len(outs) == 1):
                         refuse("graph returning more than one tensor is not supported")
                     result = env[outs[0]]
