@@ -330,6 +330,11 @@ class Emitter(op_printer.FxEmitter):
             if args[1] != 0:
                 refuse("only zero accumulators are supported")
             values[ir_node] = f"(Tensor.zeros [{', '.join(self.shape(ir_node))}])"
+        elif op == "subscript":
+            # `v[:, None]` adds a singleton axis: reshape to the captured shape.
+            if not all(index == slice(None) or index is None for index in args[1]):
+                refuse("only subscripts with `:` and `None` are supported")
+            values[ir_node] = self.reshape(values[args[0]], self.shape(ir_node))
         elif op == "_for_loop":
             self._emit_inner_loop(ir_node, values, context)
         elif op == "getitem":
@@ -397,8 +402,6 @@ class Emitter(op_printer.FxEmitter):
             refuse("only inner loops over one axis are supported")
         if list(begin) != [0]:
             refuse("only inner loops from 0 are supported")
-        if len(initial_values) > 1:
-            refuse("only inner loops carrying at most one value are supported")
         (block_id,) = loop_graph.block_ids
         extent = self.sym(end[0].meta["val"])
         if extent not in self.dim_names:
@@ -407,17 +410,26 @@ class Emitter(op_printer.FxEmitter):
         if len(placeholders) != len(initial_values):
             invalid(f"inner loop body has {len(placeholders)} inputs but the loop passes {len(initial_values)}")
         nest = context["nest"] + [block_id]
-        if not initial_values:
-            # A storing loop: each iteration writes into the output.
+        # The loop's arguments are the outside values its body reads; it returns the ones it updates.
+        results = loop_graph.graph.output_node().args[0]
+        if len(results) == 0:
+            # A storing loop: each iteration writes into the output and only reads its arguments.
             if context["state"] is None:
                 refuse("only storing loops outside loops that carry a value are supported")
-            body = self.emit_graph(loop_graph.graph, dict(values), {"nest": nest, "state": "out", "lets": []})
+            arguments = {p: values[v] for p, v in zip(placeholders, initial_values)}
+            body = self.emit_graph(
+                loop_graph.graph, {**values, **arguments}, {"nest": nest, "state": "out", "lets": []}
+            )
             context["state"] = (
                 f"(forTiles {extent} B{block_id} {context['state']} fun tile{block_id} out =>\n"
                 f"{_indent(body, 2)})"
             )
         else:
             # A carrying loop: each iteration updates one value, such as an accumulator.
+            if len(results) != 1:
+                refuse("only inner loops carrying one value are supported")
+            if len(initial_values) != 1:
+                refuse("only carrying loops that read no other outside value are supported")
             accumulator = f"acc{block_id}"
             body = self.emit_graph(
                 loop_graph.graph,
