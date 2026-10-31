@@ -25,7 +25,13 @@ _BINARY_ELEMENTWISE_KINDS = {"add": "addSpec", "sub": "subSpec", "mul_elem": "mu
 
 
 def refuse(msg: str):
+    """Stop on input that is valid but not supported yet."""
     raise NotImplementedError(msg)
+
+
+def invalid(msg: str):
+    """Stop on input that is broken, or that breaks an assumption the translator relies on."""
+    raise ValueError(msg)
 
 
 def op_name(node) -> str:
@@ -112,7 +118,7 @@ def print_op(kind: dict, args: list[str], shapes: list[list[str]]) -> tuple[str,
     """Print one normalized op and return the dimensions it requires to be positive."""
     if kind["kind"] in _BINARY_ELEMENTWISE_KINDS and len(kind) == 1:
         if len(args) != 2:
-            refuse(f"not implemented: {kind['kind']} with a scalar operand")
+            refuse(f"{kind['kind']} with a scalar operand is not supported")
         return f"(Tensor.{_BINARY_ELEMENTWISE_KINDS[kind['kind']]} {args[0]} {args[1]})", set()
     if kind == {"kind": "relu"}:
         return f"(Activation.reluSpec {args[0]})", set()
@@ -122,7 +128,7 @@ def print_op(kind: dict, args: list[str], shapes: list[list[str]]) -> tuple[str,
         return f"(Activation.softmaxSpec 1 {args[0]})", set()
     if kind == {"kind": "reduce_sum", "axes": [1], "keepdim": False} and len(shapes[0]) == 2:
         return f"(Tensor.reduceSum 1 {args[0]} (.succ (Shape.hasNonemptyAxisZeroOfPos h{shapes[0][1]}).proof))", {shapes[0][1]}
-    refuse(f"not implemented: {kind}")
+    refuse(f"op {kind} is not supported")
 
 
 class FxEmitter:
@@ -137,7 +143,7 @@ class FxEmitter:
         """Resolve a captured size symbol to its Lean parameter name."""
         if isinstance(v, torch.SymInt) and v.node.expr in self.names:
             return self.names[v.node.expr]
-        refuse(f"size {v} is not a named size")
+        refuse(f"tensor size {v} is not supported")
 
     def shape(self, node) -> list[str]:
         """Read a node's tensor shape as Lean dimension names, or `1` for a singleton axis."""
@@ -172,8 +178,10 @@ class FxEmitter:
         """Broadcast `value` between equal-rank shapes; each axis of `shape` must match `target` or be `1`."""
         if shape == target:
             return value
-        if len(shape) != len(target) or any(s not in (t, "1") for s, t in zip(shape, target)):
-            refuse(f"cannot broadcast {shape} to {target}")
+        if len(shape) != len(target):
+            refuse(f"broadcasting {shape} to {target} is not supported")
+        if any(s not in (t, "1") for s, t in zip(shape, target)):
+            invalid(f"cannot broadcast {shape} to {target}")
         return f"(Tensor.broadcastTo (s₂ := [{', '.join(target)}]) (by simp [Shape.CanBroadcastTo]) {value})"
 
     def reshape(self, value: str, target: list[str]) -> str:
@@ -182,7 +190,7 @@ class FxEmitter:
 
     def node(self, n, env: dict, ctx: dict):
         """Refuse non-ATen nodes unless a subclass supplies their translation."""
-        refuse(f"unsupported op: {op_name(n)}")
+        refuse(f"op {op_name(n)} is not supported")
 
     def emit_graph(self, graph, env: dict, ctx: dict) -> str:
         """Return Lean code for a graph; `env` holds node values and `ctx` collects lets and output state."""
@@ -194,7 +202,7 @@ class FxEmitter:
                 outs = n.args[0]
                 if outs is not None:
                     if not (isinstance(outs, (list, tuple)) and len(outs) == 1):
-                        refuse("graph must return one tensor")
+                        refuse("graph returning more than one tensor is not supported")
                     result = env[outs[0]]
             elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in SYM_OPS:
                 env[n] = self.aten(n, env)

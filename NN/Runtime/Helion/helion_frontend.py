@@ -14,7 +14,7 @@ _printer_spec = importlib.util.spec_from_file_location(
 op_printer = importlib.util.module_from_spec(_printer_spec)
 _printer_spec.loader.exec_module(op_printer)
 
-refuse = op_printer.refuse
+refuse, invalid = op_printer.refuse, op_printer.invalid
 
 
 def _indent(text: str, spaces: int) -> str:
@@ -75,26 +75,28 @@ class Emitter(op_printer.FxEmitter):
         The shared emitter replaces `bridge._DIM_NAMES` with this kernel's size-name map.
         """
         if kernel.settings.static_shapes:
-            refuse("kernel must set static_shapes=False so sizes stay symbolic")
+            refuse("only static_shapes=False is supported")
         try:
             bound_kernel = kernel.bind(tuple(example_args))
         except Exception as error:
             first_line = str(error).splitlines()[0] if str(error) else ""
-            refuse(f"Helion could not bind the kernel: {type(error).__name__}: {first_line}")
+            invalid(f"Helion could not bind the kernel: {type(error).__name__}: {first_line}")
         self.fn_name = kernel.fn.__name__
         self.host_function = bound_kernel.host_function
         self.helion_env = bound_kernel.env
         self.device_ir = self.host_function.device_ir
         params = [arg.arg for arg in self.host_function.definition.args.args]
         if len(params) != len(example_args):
-            refuse(f"kernel takes {params}; tensor arguments only for now")
+            refuse("only calls that pass every parameter are supported")
         # Python argument name -> Lean input name, in signature order.
         self.lean_inputs = {name: op_printer.input_name(i) for i, name in enumerate(params)}
         # Name each size symbol by first appearance; sizes Helion shares between inputs share a name.
         dimension_names, self.input_shapes = {}, {}
         for name, fake in zip(params, bound_kernel.fake_args):
+            if not isinstance(fake, torch.Tensor):
+                refuse("only tensor parameters are supported")
             if not all(isinstance(size, torch.SymInt) for size in fake.shape):
-                refuse(f"a size of {name} is static")
+                refuse("only symbolic sizes are supported")
             for size in fake.shape:
                 dimension_names.setdefault(size.node.expr, op_printer.size_name(len(dimension_names)))
             self.input_shapes[self.lean_inputs[name]] = [dimension_names[size.node.expr] for size in fake.shape]
@@ -131,7 +133,7 @@ class Emitter(op_printer.FxEmitter):
             or not isinstance(body[-2], ast.For)
             or not isinstance(body[-1], ast.Return)
         ):
-            refuse("host code must end with one grid loop followed by `return`")
+            refuse("only host code that ends with one grid loop followed by `return` is supported")
         *prelude, grid_loop, return_statement = body
         used_names = set(self.lean_inputs)
         size_names = set()
@@ -143,7 +145,7 @@ class Emitter(op_printer.FxEmitter):
                 or not isinstance(statement.value, ast.Call)
                 or used_names & set(names)
             ):
-                refuse(f"host statement not in the supported pattern: {ast.unparse(statement)}")
+               th
             used_names.update(names)
             if self._is_input_size_read(statement.value):
                 size_names.update(names)
@@ -154,21 +156,21 @@ class Emitter(op_printer.FxEmitter):
             ):
                 output_name = names[0]
             else:
-                refuse(f"host statement not in the supported pattern: {ast.unparse(statement)}")
+                refuse("only reading sizes and allocating the output are supported in host code")
         if not self._is_grid_iterator(grid_loop.iter, size_names):
-            refuse(f"grid loop must be `hl.tile(size)` or `hl.tile([sizes])`: {ast.unparse(grid_loop.iter)}")
+            refuse("only grid loops over `hl.tile` of input sizes are supported")
         if any(
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Store)
             and (node.id in self.lean_inputs or node.id == output_name)
             for node in ast.walk(grid_loop)
         ):
-            refuse("the grid loop rebinds the argument or the output")
+            refuse("assigning to an argument or the output in the grid loop is not supported")
         if output_name is None or not (
             isinstance(return_statement.value, ast.Name)
             and return_statement.value.id == output_name
         ):
-            refuse("the kernel must return the tensor it allocates with torch.empty")
+            refuse("only returning the `torch.empty` output is supported")
         return output_name
 
     def _is_input_size_read(self, call) -> bool:
@@ -222,7 +224,7 @@ class Emitter(op_printer.FxEmitter):
         """Look up the block number Helion assigned to this symbolic tile index."""
         if isinstance(value, torch.SymInt) and value.node.expr in self.block_ids:
             return self.block_ids[value.node.expr]
-        refuse(f"{value} is not a tile")
+        refuse("only tiled axes are supported")
 
     def _loop_bounds(self, blocks: list[int]) -> list[str]:
         """Return the sizes the loops of `blocks` run to: Helion's mask bounds for their tiles."""
@@ -231,7 +233,7 @@ class Emitter(op_printer.FxEmitter):
     def _record_in_bounds(self, bounds: list[str], dimensions: list[str]):
         """Record that every masked-in lane lies inside the tensor: `bound ≤ size` on each axis."""
         if len(bounds) != len(dimensions):
-            refuse(f"tile of rank {len(bounds)} on a tensor of rank {len(dimensions)}")
+            invalid(f"tile of rank {len(bounds)} on a tensor of rank {len(dimensions)}")
         for bound, size in zip(bounds, dimensions, strict=True):
             if bound != size and f"{bound} ≤ {size}" not in self.in_bounds:
                 self.in_bounds.append(f"{bound} ≤ {size}")
@@ -266,19 +268,19 @@ class Emitter(op_printer.FxEmitter):
         """
         blocks, bounds, tiles = self._tile_layout(ir_node)
         if len(indices) != len(blocks):
-            refuse("indexing must give every axis a tile or `:`")
+            refuse("only indexing every axis with a tile or `:` is supported")
         for index, block, tile_index in zip(indices, blocks, tiles):
             if isinstance(index, slice):
                 # Only full slices (`:`) are supported; their block starts at tile index 0.
-                if index != slice(None) or tile_index != "0":
-                    refuse("a sliced axis must be a full slice `:`")
+                if index != slice(None):
+                    refuse("only full slices `:` are supported")
+                if tile_index != "0":
+                    invalid("expected Helion to cover a `:` axis with one whole-axis block")
+            elif not isinstance(index, torch.fx.Node):
+                refuse("only tiles and `:` are supported as indices")
             # A tile index must be the current tile of an enclosing loop over that axis's block.
-            elif (
-                not isinstance(index, torch.fx.Node)
-                or self._block_id_of(index.meta["val"]) != block
-                or block not in context["tiles"]
-            ):
-                refuse("index is not the tile of an enclosing loop for that axis")
+            elif self._block_id_of(index.meta["val"]) != block or block not in context["tiles"]:
+                invalid("index is not the tile of an enclosing loop for that axis")
         return blocks, bounds, tiles
 
     def aten(self, ir_node, values: dict) -> str:
@@ -295,10 +297,12 @@ class Emitter(op_printer.FxEmitter):
             or op_printer.op_name(operand) != "_mask_to"
             or operand.args[1] != float("-inf")
         ):
-            refuse("amax requires an input masked to -inf")
+            refuse("only amax over an input masked to -inf is supported")
         rank = len(operand.meta["val"].shape)
-        if len(dims) != 1 or not -rank <= dims[0] < rank:
-            refuse("amax must reduce one valid axis")
+        if len(dims) != 1:
+            refuse("only amax over one axis is supported")
+        if not -rank <= dims[0] < rank:
+            invalid(f"amax axis {dims[0]} is out of range for a rank-{rank} tensor")
         axis = dims[0] % rank  # Convert negative axis numbering to nonnegative.
         blocks, bounds, tiles = self._tile_layout(operand)
         original = values[operand.args[0]]  # The tile before `_mask_to`; `maskedMax` skips its masked lanes.
@@ -320,17 +324,17 @@ class Emitter(op_printer.FxEmitter):
             values[ir_node] = values[args[0]]
         elif op == "_host_tensor":
             if args[0] not in self.lean_inputs and args[0] != self.output_name:
-                refuse(f"host tensor {args[0]} is neither an argument nor the output")
+                refuse("only the arguments and the output are supported in device code")
             values[ir_node] = self.lean_inputs.get(args[0], ("OUT",))
         elif op == "full":
             if args[1] != 0:
-                refuse(f"full with value {args[1]}; only zero accumulators for now")
+                refuse("only zero accumulators are supported")
             values[ir_node] = f"(Tensor.zeros [{', '.join(self.shape(ir_node))}])"
         elif op == "_for_loop":
             values[ir_node] = self._emit_inner_loop(ir_node, values, context["tiles"])
         elif op == "getitem":
             if args[1] != 0:
-                refuse("loop with more than one result")
+                refuse("only loops with one result are supported")
             values[ir_node] = values[args[0]]
         elif op == "_phi":
             before, after = args[0], args[1]
@@ -340,7 +344,7 @@ class Emitter(op_printer.FxEmitter):
                 or op_printer.op_name(loop) != "_for_loop"
                 or loop.args[3][0] is not before
             ):
-                refuse("phi must merge a loop's initial value with that loop's result")
+                refuse("only phis for a loop's carried value are supported")
             block_id = self.device_ir.graphs[loop.args[0]].block_ids[0]
             name = f"acc{block_id}"
             context["lets"].append(f"let {name} := {op_printer.unparen(values[args[1]])}")
@@ -355,28 +359,27 @@ class Emitter(op_printer.FxEmitter):
                 blocks, bounds, tiles = self._tile_layout(ir_node)
                 values[ir_node] = f"(maskTo {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] 0 {values[args[0]]})"
             else:
-                refuse(f"_mask_to with fill {args[1]}; only 0 and -inf for now")
+                refuse("only _mask_to with fill 0 or -inf is supported")
         elif op == "load":
             source, indices = args[0], args[1]
-            if (
-                values[source] not in self.input_shapes
-                or (len(args) > 2 and args[2] is not None)
-            ):
-                refuse("load must read a tile of an argument without an extra mask")
+            if values[source] not in self.input_shapes:
+                refuse("only loads from an argument are supported")
+            if len(args) > 2 and args[2] is not None:
+                refuse("only loads without an extra mask are supported")
             blocks, bounds, tiles = self._indexed_tile_layout(ir_node, indices, context)
             self._record_in_bounds(bounds, self.shape(source))
             values[ir_node] = f"(loadTile {_tile_args(blocks, bounds)} 0 {values[source]} ![{', '.join(tiles)}])"
         elif op == "store":
             destination, indices, value = args[0], args[1], args[2]
-            if (
-                context["state"] is None
-                or values[destination] != ("OUT",)
-                or (len(args) > 3 and args[3] is not None)
-            ):
-                refuse("store must write the output at the grid tiles, in the grid body")
+            if context["state"] is None:
+                refuse("only stores in the grid body are supported")
+            if values[destination] != ("OUT",):
+                refuse("only stores into the output are supported")
+            if len(args) > 3 and args[3] is not None:
+                refuse("only stores without an extra mask are supported")
             blocks, bounds, tiles = self._indexed_tile_layout(value, indices, context)
             if [b for b, t in zip(blocks, tiles) if t != "0"] != self.grid_blocks:
-                refuse("store indices are not the grid tiles, in order, and full slices")
+                refuse("only stores at the grid tiles, in order, are supported")
             self.output_shape = self.shape(destination)
             self._record_in_bounds(bounds, self.output_shape)
             self.store_count += 1
@@ -384,27 +387,26 @@ class Emitter(op_printer.FxEmitter):
                 f"(storeTile {_tile_args(blocks, bounds)} {context['state']} ![{', '.join(tiles)}] {values[value]})"
             )
         else:
-            refuse(f"unsupported op in device IR: {op}")
+            refuse(f"device op {op} is not supported")
 
     def _emit_inner_loop(self, ir_node, values: dict, enclosing_tiles: set[int]) -> str:
         """Emit a Lean `forTiles` expression for an inner `hl.tile` loop that updates one value."""
         graph_id, begin, end, initial_values = ir_node.args[:4]
         loop_graph = self.device_ir.graphs[graph_id]
-        if (
-            len(loop_graph.block_ids) != 1
-            or list(begin) != [0]
-            or len(end) != 1
-            or len(initial_values) != 1
-        ):
-            refuse("inner loop must be one hl.tile from 0 carrying one value")
+        if len(loop_graph.block_ids) != 1 or len(end) != 1:
+            refuse("only inner loops over one axis are supported")
+        if list(begin) != [0]:
+            refuse("only inner loops from 0 are supported")
+        if len(initial_values) != 1:
+            refuse("only inner loops carrying one value are supported")
         (block_id,) = loop_graph.block_ids
         extent = self.sym(end[0].meta["val"])
         if extent not in self.dim_names:
-            refuse(f"inner loop runs to {extent}, not an input size")
+            refuse("only inner loops up to an input size are supported")
         accumulator = f"acc{block_id}"
         placeholders = loop_graph.graph.find_nodes(op="placeholder")
-        if len(placeholders) != 1:
-            refuse("inner loop body must read only its carried value from outside")
+        if len(placeholders) != len(initial_values):
+            invalid(f"inner loop body has {len(placeholders)} inputs but the loop passes {len(initial_values)}")
         placeholder = placeholders[0]
         body = self.emit_graph(
             loop_graph.graph,
@@ -419,10 +421,10 @@ class Emitter(op_printer.FxEmitter):
     def emit(self, name: str, source: str) -> str:
         """Emit the complete Lean module for the outer `hl.tile` grid loop and its body."""
         if len(self.device_ir.grid_block_ids) != 1:
-            refuse(f"grids {self.device_ir.grid_block_ids}; one grid for now")
+            refuse("only one grid loop is supported")
         self.grid_blocks = list(self.device_ir.grid_block_ids[0])
         if len(self.device_ir.root_ids) != 1:
-            refuse(f"device IR has {len(self.device_ir.root_ids)} root graphs; expected one")
+            refuse("only one root graph is supported")
         root = self.device_ir.graphs[self.device_ir.root_ids[0]].graph
         body = self.emit_graph(root, {}, {"tiles": set(self.grid_blocks), "state": "out", "lets": []})
         # Only the root graph, where each full slice is one block, is translated. Helion runs it
@@ -432,9 +434,11 @@ class Emitter(op_printer.FxEmitter):
             any(type(graph).__name__ == "ReductionLoopGraphInfo" for graph in self.device_ir.graphs)
             and not self.full_slices
         ):
-            refuse("device IR has reduction-loop graphs but the root graph has no full slice")
-        if self.store_count != 1:
-            refuse(f"expected one store into {self.output_name}, found {self.store_count}")
+            invalid("device IR has reduction-loop graphs but the root graph has no full slice")
+        if self.store_count == 0:
+            invalid(f"the kernel never stores into {self.output_name}")
+        if self.store_count > 1:
+            refuse("only one store into the output is supported")
         output_shape = ", ".join(self.output_shape)
         block_parameters = " ".join(f"B{block}" for block in sorted(self.block_ids.values()))
         positivity_hypotheses = [
