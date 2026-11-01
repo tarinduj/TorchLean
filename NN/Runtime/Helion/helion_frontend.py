@@ -110,6 +110,51 @@ class Emitter(op_printer.FxEmitter):
         self.store_count = 0
         self.in_bounds = []   # loop bound ≤ tensor size, for every load and store; trivial ones omitted
         self.full_slices = []  # axis size ≤ block size, for every full slice (`:`)
+        self.carried_arguments = self._carried_arguments()
+
+    def _carried_arguments(self) -> dict:
+        """Map each loop's result indices to the argument indices they update.
+
+        Python:
+            for tile_n in hl.tile(n):
+                acc = x[tile_m, tile_n].sum(1) * scale + acc
+
+        Captured graphs:
+            body(scale, acc):
+                new_acc = add(mul(sum(load(x, ...)), scale), acc)
+                return [new_acc]
+
+            outer:
+                loop = _for_loop(body, [0], [n], [scale, acc])
+                result = getitem(loop, 0)
+                acc_after = _phi(acc, result)
+
+        Returns `{loop: [1]}`, since `acc` is argument 1.
+        """
+        carries = {}
+        # One slot per loop result.
+        for info in self.device_ir.graphs:
+            for loop in info.graph.nodes:
+                if op_printer.op_name(loop) == "_for_loop":
+                    results = self.device_ir.graphs[loop.args[0]].graph.output_node().args[0]
+                    carries[loop] = [None] * len(results)
+        # Fill each slot from its phi.
+        for info in self.device_ir.graphs:
+            for phi in info.graph.nodes:
+                if op_printer.op_name(phi) != "_phi":
+                    continue
+                acc, result = phi.args
+                if op_printer.op_name(result) != "getitem" or op_printer.op_name(result.args[0]) != "_for_loop":
+                    continue
+                loop, index = result.args
+                arguments = loop.args[3]
+                if acc not in arguments or carries[loop][index] is not None:
+                    invalid("expected one phi per loop result")
+                carries[loop][index] = arguments.index(acc)
+        # Every slot must be filled.
+        if any(None in carried for carried in carries.values()):
+            invalid("expected one phi per loop result")
+        return carries
 
     def _validate_host_and_find_output(self) -> str:
         """Check this host-code pattern and return the allocated output's name:
@@ -338,22 +383,16 @@ class Emitter(op_printer.FxEmitter):
         elif op == "_for_loop":
             self._emit_inner_loop(ir_node, values, context)
         elif op == "getitem":
-            if args[1] != 0:
+            if op_printer.op_name(args[0]) != "_for_loop":
+                refuse("only getitem of a loop's result is supported")
+            if len(self.carried_arguments[args[0]]) != 1:
                 refuse("only loops with one result are supported")
             values[ir_node] = values[args[0]]
         elif op == "_phi":
-            before, after = args[0], args[1]
-            loop = after.args[0] if op_printer.op_name(after) == "getitem" else None
-            if (
-                loop is None
-                or op_printer.op_name(loop) != "_for_loop"
-                or loop.args[3][0] is not before
-            ):
-                refuse("only phis for a loop's carried value are supported")
-            block_id = self.device_ir.graphs[loop.args[0]].block_ids[0]
-            name = f"acc{block_id}"
-            context["lets"].append(f"let {name} := {op_printer.unparen(values[args[1]])}")
-            values[ir_node] = name
+            before, after = args
+            if op_printer.op_name(after) != "getitem" or op_printer.op_name(after.args[0]) != "_for_loop":
+                refuse("only phis after loops are supported")
+            values[ir_node] = values[after]
         elif op == "_mask_to":
             if args[1] == float("-inf"):
                 users = list(ir_node.users)
@@ -411,12 +450,13 @@ class Emitter(op_printer.FxEmitter):
             invalid(f"inner loop body has {len(placeholders)} inputs but the loop passes {len(initial_values)}")
         nest = context["nest"] + [block_id]
         # The loop's arguments are the outside values its body reads; it returns the ones it updates.
-        results = loop_graph.graph.output_node().args[0]
-        if len(results) == 0:
+        # The arguments the loop updates; the others are only read.
+        carried = self.carried_arguments[ir_node]
+        arguments = {p: values[v] for p, v in zip(placeholders, initial_values)}
+        if len(carried) == 0:
             # A storing loop: each iteration writes into the output and only reads its arguments.
             if context["state"] is None:
                 refuse("only storing loops outside loops that carry a value are supported")
-            arguments = {p: values[v] for p, v in zip(placeholders, initial_values)}
             body = self.emit_graph(
                 loop_graph.graph, {**values, **arguments}, {"nest": nest, "state": "out", "lets": []}
             )
@@ -425,21 +465,19 @@ class Emitter(op_printer.FxEmitter):
                 f"{_indent(body, 2)})"
             )
         else:
-            # A carrying loop: each iteration updates one value, such as an accumulator.
-            if len(results) != 1:
+            # A carrying loop, e.g. an accumulator.
+            if len(carried) != 1:
                 refuse("only inner loops carrying one value are supported")
-            if len(initial_values) != 1:
-                refuse("only carrying loops that read no other outside value are supported")
             accumulator = f"acc{block_id}"
+            arguments[placeholders[carried[0]]] = accumulator
             body = self.emit_graph(
-                loop_graph.graph,
-                {**values, placeholders[0]: accumulator},
-                {"nest": nest, "state": None, "lets": []},
+                loop_graph.graph, {**values, **arguments}, {"nest": nest, "state": None, "lets": []}
             )
-            values[ir_node] = (
-                f"(forTiles {extent} B{block_id} {values[initial_values[0]]} "
-                f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)})"
+            context["lets"].append(
+                f"let {accumulator} := forTiles {extent} B{block_id} {values[initial_values[carried[0]]]} "
+                f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)}"
             )
+            values[ir_node] = accumulator
 
     def emit(self, name: str, source: str) -> str:
         """Emit the complete Lean module for the outer `hl.tile` grid loop and its body."""
