@@ -1,6 +1,8 @@
 """Translate supported FX graphs into Lean calls over TorchLean tensors."""
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 
 SYM_OPS = ("sym_size.int", "sym_size")
@@ -175,6 +177,18 @@ def amax_kind(n) -> dict:
     return {"kind": "reduce_max", "axes": [dims[0] % rank], "keepdim": bool(keepdim)}
 
 
+@dataclasses.dataclass
+class Context:
+    """Track the enclosing loops, current output, and generated let lines for one graph body.
+
+    Grid body: `Context(nest=[0], state="out", lets=[])`.
+    Inner loop updating an accumulator: `Context(nest=[0, 1], state=None, lets=[])`.
+    """
+    nest: list[int] = dataclasses.field(default_factory=list)  # block ids of the enclosing tile loops
+    state: str | None = None  # the output as stored so far, in a body that stores
+    lets: list[str] = dataclasses.field(default_factory=list)  # bindings before the body's result
+
+
 class FxEmitter:
     """Walk an FX graph, printing ATen nodes; subclasses handle other node kinds."""
 
@@ -239,11 +253,11 @@ class FxEmitter:
         """Reshape `value` to `target`, e.g. a reduction's result to its `keepdim` shape."""
         return f"(Tensor.reshapeSpec (target := [{', '.join(target)}]) {value} (by simp [Shape.size]))"
 
-    def node(self, n, env: dict, ctx: dict):
+    def node(self, n, env: dict, ctx: Context):
         """Refuse non-ATen nodes unless a subclass supplies their translation."""
         refuse(f"op {op_name(n)} is not supported")
 
-    def emit_graph(self, graph, env: dict, ctx: dict) -> str:
+    def emit_graph(self, graph, env: dict, ctx: Context) -> str:
         """Return Lean code for a graph; `env` holds node values and `ctx` collects lets and output state."""
         result = None
         for n in graph.nodes:
@@ -258,10 +272,10 @@ class FxEmitter:
             elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in SYM_OPS:
                 env[n] = self.aten(n, env)
                 if len(n.users) > 1:
-                    ctx["lets"].append(f"let v_{n.name} := {unparen(env[n])}")
+                    ctx.lets.append(f"let v_{n.name} := {unparen(env[n])}")
                     env[n] = f"v_{n.name}"
             elif op_name(n) in SYM_OPS:
                 env[n] = self.sym(n.meta["val"])
             else:
                 self.node(n, env, ctx)
-        return "\n".join(ctx["lets"] + [unparen(ctx["state"]) if result is None else result])
+        return "\n".join(ctx.lets + [unparen(ctx.state) if result is None else result])

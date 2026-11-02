@@ -2,17 +2,15 @@
 from __future__ import annotations
 
 import ast
-import importlib.util
 import pathlib
+import sys
 import textwrap
 
 import torch
 
-_fx_emitter_spec = importlib.util.spec_from_file_location(
-    "fx_emitter", pathlib.Path(__file__).with_name("fx_emitter.py")
-)
-fx_emitter = importlib.util.module_from_spec(_fx_emitter_spec)
-_fx_emitter_spec.loader.exec_module(fx_emitter)
+sys.path.insert(0, str(pathlib.Path(__file__).parent))  # the sibling module `fx_emitter`
+import fx_emitter  # noqa: E402
+from fx_emitter import Context  # noqa: E402
 
 refuse, invalid = fx_emitter.refuse, fx_emitter.invalid
 
@@ -340,7 +338,9 @@ class Emitter(fx_emitter.FxEmitter):
                 tiles.append(f"tile{block}")
         return blocks, self._loop_bounds(blocks), tiles
 
-    def _indexed_tile_layout(self, ir_node, indices, context: dict) -> tuple[list[int], list[str], list[str]]:
+    def _indexed_tile_layout(
+        self, ir_node, indices, ctx: Context
+    ) -> tuple[list[int], list[str], list[str]]:
         """Check that each index is an enclosing loop's tile or a full slice (`:`).
 
         Return the block IDs, loop bounds and tile indices for the load or store.
@@ -358,7 +358,7 @@ class Emitter(fx_emitter.FxEmitter):
             elif not isinstance(index, torch.fx.Node):
                 refuse("only tiles and `:` are supported as indices")
             # A tile index must be the current tile of an enclosing loop over that axis's block.
-            elif self._block_id_of(index.meta["val"]) != block or block not in context["nest"]:
+            elif self._block_id_of(index.meta["val"]) != block or block not in ctx.nest:
                 invalid("index is not the tile of an enclosing loop for that axis")
         return blocks, bounds, tiles
 
@@ -438,7 +438,7 @@ class Emitter(fx_emitter.FxEmitter):
         else:
             refuse("extended reals are supported only in maximum, subtraction and exp")
 
-    def node(self, ir_node, env: dict, context: dict):
+    def node(self, ir_node, env: dict, ctx: Context):
         """Translate a Helion-specific IR node into Lean.
 
         Tile loops, carried values, loads, and stores are handled here. ATen
@@ -474,7 +474,7 @@ class Emitter(fx_emitter.FxEmitter):
             if args[0] in self.ereal:
                 self.ereal[ir_node] = self.ereal[args[0]]
         elif op == "_for_loop":
-            self._emit_inner_loop(ir_node, env, context)
+            self._emit_inner_loop(ir_node, env, ctx)
         elif op == "getitem":
             if fx_emitter.op_name(args[0]) != "_for_loop":
                 refuse("only getitem of a loop's result is supported")
@@ -509,12 +509,12 @@ class Emitter(fx_emitter.FxEmitter):
                 refuse("only loads from an argument are supported")
             if len(args) > 2 and args[2] is not None:
                 refuse("only loads without an extra mask are supported")
-            blocks, bounds, tiles = self._indexed_tile_layout(ir_node, indices, context)
+            blocks, bounds, tiles = self._indexed_tile_layout(ir_node, indices, ctx)
             self._record_in_bounds(bounds, self.shape(source))
             env[ir_node] = f"(loadTile {_tile_args(blocks, bounds)} 0 {env[source]} ![{', '.join(tiles)}])"
         elif op == "store":
             destination, indices, value = args[0], args[1], args[2]
-            if context["state"] is None:
+            if ctx.state is None:
                 refuse("only stores outside loops that carry a value are supported")
             if env[destination] != ("OUT",):
                 refuse("only stores into the output are supported")
@@ -522,19 +522,19 @@ class Emitter(fx_emitter.FxEmitter):
                 refuse("only stores without an extra mask are supported")
             if value in self.ereal:
                 refuse("only storing real values is supported")
-            blocks, bounds, tiles = self._indexed_tile_layout(value, indices, context)
-            if [b for b, t in zip(blocks, tiles) if t != "0"] != context["nest"]:
+            blocks, bounds, tiles = self._indexed_tile_layout(value, indices, ctx)
+            if [b for b, t in zip(blocks, tiles) if t != "0"] != ctx.nest:
                 refuse("only stores at the enclosing loops' tiles, in order, are supported")
             self.output_shape = self.shape(destination)
             self._record_in_bounds(bounds, self.output_shape)
             self.store_count += 1
-            context["state"] = (
-                f"(storeTile {_tile_args(blocks, bounds)} {context['state']} ![{', '.join(tiles)}] {env[value]})"
+            ctx.state = (
+                f"(storeTile {_tile_args(blocks, bounds)} {ctx.state} ![{', '.join(tiles)}] {env[value]})"
             )
         else:
             refuse(f"device op {op} is not supported")
 
-    def _emit_inner_loop(self, ir_node, env: dict, context: dict):
+    def _emit_inner_loop(self, ir_node, env: dict, ctx: Context):
         """Emit an inner `hl.tile` loop as `forTiles`."""
         graph_id, begin, end, initial_values = ir_node.args[:4]
         loop_graph = self.device_ir.graphs[graph_id]
@@ -549,7 +549,7 @@ class Emitter(fx_emitter.FxEmitter):
         placeholders = loop_graph.graph.find_nodes(op="placeholder")
         if len(placeholders) != len(initial_values):
             invalid(f"inner loop body has {len(placeholders)} inputs but the loop passes {len(initial_values)}")
-        nest = context["nest"] + [block_id]
+        nest = ctx.nest + [block_id]
         # The loop's arguments are the outside values its body reads; it returns the ones it updates.
         # The arguments the loop updates; the others are only read.
         carried = self.carried_arguments[ir_node]
@@ -557,13 +557,13 @@ class Emitter(fx_emitter.FxEmitter):
         self.ereal |= {p: self.ereal[v] for p, v in zip(placeholders, initial_values) if v in self.ereal}
         if len(carried) == 0:
             # A storing loop: each iteration writes into the output and only reads its arguments.
-            if context["state"] is None:
+            if ctx.state is None:
                 refuse("only storing loops outside loops that carry a value are supported")
             body = self.emit_graph(
-                loop_graph.graph, {**env, **arguments}, {"nest": nest, "state": "out", "lets": []}
+                loop_graph.graph, {**env, **arguments}, Context(nest=nest, state="out")
             )
-            context["state"] = (
-                f"(forTiles {extent} B{block_id} {context['state']} fun tile{block_id} out =>\n"
+            ctx.state = (
+                f"(forTiles {extent} B{block_id} {ctx.state} fun tile{block_id} out =>\n"
                 f"{_indent(body, 2)})"
             )
         else:
@@ -573,7 +573,7 @@ class Emitter(fx_emitter.FxEmitter):
                 arguments[placeholders[argument]] = _component(accumulator, i, len(carried))
             initial = f"({', '.join(fx_emitter.unparen(env[initial_values[a]]) for a in carried)})"
             body = self.emit_graph(
-                loop_graph.graph, {**env, **arguments}, {"nest": nest, "state": None, "lets": []}
+                loop_graph.graph, {**env, **arguments}, Context(nest=nest)
             )
             # Each carried value must keep its type: real, or extended.
             results = self._loop_results(ir_node)
@@ -590,7 +590,7 @@ class Emitter(fx_emitter.FxEmitter):
                     for fact in (f"0 < {extent}", f"0 < B{block_id}"):
                         if fact not in self.nonempty_loops:
                             self.nonempty_loops.append(fact)
-            context["lets"].append(
+            ctx.lets.append(
                 f"let {accumulator} := forTiles {extent} B{block_id} {initial} "
                 f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)}"
             )
@@ -604,7 +604,7 @@ class Emitter(fx_emitter.FxEmitter):
         if len(self.device_ir.root_ids) != 1:
             refuse("only one root graph is supported")
         root = self.device_ir.graphs[self.device_ir.root_ids[0]].graph
-        body = self.emit_graph(root, {}, {"nest": list(self.grid_blocks), "state": "out", "lets": []})
+        body = self.emit_graph(root, {}, Context(nest=list(self.grid_blocks), state="out"))
         # Only the root graph, where each full slice is one block, is translated. Helion runs it
         # for configs whose `reduction_loops` entries are `None`; other configs run the
         # reduction-loop graphs, which split full slices into chunks.
