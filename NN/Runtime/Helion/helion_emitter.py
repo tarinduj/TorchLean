@@ -362,7 +362,7 @@ class Emitter(fx_emitter.FxEmitter):
                 invalid("index is not the tile of an enclosing loop for that axis")
         return blocks, bounds, tiles
 
-    def aten(self, ir_node, env: dict) -> str:
+    def aten(self, ir_node, env: dict) -> LoweredValue:
         """Translate ops on extended reals and masked `amax`; send other ATen ops to the shared printer."""
         if any(operand in self.ereal for operand in ir_node.all_input_nodes):
             return self._ereal_op(ir_node, env)
@@ -371,7 +371,7 @@ class Emitter(fx_emitter.FxEmitter):
         else:
             return super().aten(ir_node, env)
 
-    def _masked_amax(self, ir_node, env: dict) -> str:
+    def _masked_amax(self, ir_node, env: dict) -> LoweredValue:
         """Print `amax` over a tile masked to -inf as `maskedMax`.
 
         Python:
@@ -398,9 +398,9 @@ class Emitter(fx_emitter.FxEmitter):
         original = env[operand.args[0]].expr  # The tile before `_mask_to`; `maskedMax` skips its masked lanes.
         call = f"(maskedMax {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] {axis} {original})"
         # Restore the singleton axis when keepdim=True.
-        return self.reshape(call, self.shape(ir_node)) if keepdim else call
+        return LoweredValue(self.reshape(call, self.shape(ir_node)) if keepdim else call, Kind.COMPUTED)
 
-    def _ereal_op(self, ir_node, env: dict) -> str:
+    def _ereal_op(self, ir_node, env: dict) -> LoweredValue:
         """Print an op on extended reals: `maximum` and subtraction stay in `EReal`, `exp` returns to `ℝ`.
 
         Python:
@@ -422,12 +422,12 @@ class Emitter(fx_emitter.FxEmitter):
             arg: env[arg] if arg in self.ereal else LoweredValue(f"(toEReal {env[arg].expr})", Kind.COMPUTED)
             for arg in ir_node.args}
         if op == "exp.default":
-            return f"(expE {env[ir_node.args[0]].expr})"
+            return LoweredValue(f"(expE {env[ir_node.args[0]].expr})", Kind.COMPUTED)
         elif op == "maximum.default":
             operands = self.elementwise_operands(ir_node, ir_node.args, promoted)
             # The max is `⊥` only where every operand is.
             self.ereal[ir_node] = all(self.ereal.get(arg, False) for arg in ir_node.args)
-            return f"(Tensor.map2Spec max {' '.join(operands)})"
+            return LoweredValue(f"(Tensor.map2Spec max {' '.join(operands)})", Kind.COMPUTED)
         elif op == "sub.Tensor":
             minuend, subtrahend = ir_node.args
             # A finite value minus `⊥` is `⊤`, which `expE` gets wrong.
@@ -435,7 +435,7 @@ class Emitter(fx_emitter.FxEmitter):
                 refuse("only subtracting values that cannot be -inf is supported")
             operands = self.elementwise_operands(ir_node, ir_node.args, promoted)
             self.ereal[ir_node] = self.ereal.get(minuend, False)
-            return f"(Tensor.map2Spec (· - ·) {' '.join(operands)})"
+            return LoweredValue(f"(Tensor.map2Spec (· - ·) {' '.join(operands)})", Kind.COMPUTED)
         else:
             refuse("extended reals are supported only in maximum, subtraction and exp")
 

@@ -233,7 +233,7 @@ class FxEmitter:
         """Read a node's tensor shape as Lean dimension names, or `1` for a singleton axis."""
         return ["1" if isinstance(s, int) and s == 1 else self.sym(s) for s in node.meta["val"].shape]
 
-    def aten(self, n, env) -> str:
+    def aten(self, n, env) -> LoweredValue:
         """Lower an ATen node with the bridge, then print its TorchLean tensor call.
 
         Each value keeps its captured shape: an elementwise operand is broadcast to the node's
@@ -258,7 +258,7 @@ class FxEmitter:
             kind = {**kind, "keepdim": False}
         call, positive = print_op(kind, args, shapes)
         self.hyps |= positive
-        return self.reshape(call, self.shape(n)) if keepdim else call
+        return LoweredValue(self.reshape(call, self.shape(n)) if keepdim else call, Kind.COMPUTED)
 
     def elementwise_operands(self, n, operands, env: dict) -> list[str]:
         """Broadcast each operand of elementwise `n`, as printed in `env`, to `n`'s shape."""
@@ -296,7 +296,7 @@ class FxEmitter:
                     result = unparen(env[outs[0]].expr) if len(outs) == 1 else (
                         f"({', '.join(unparen(env[out].expr) for out in outs)})")
             elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in SYM_OPS:
-                env[n] = LoweredValue(self.aten(n, env), Kind.COMPUTED)
+                env[n] = self.aten(n, env)
                 if len(n.users) > 1:
                     ctx.lets.append(f"let v_{n.name} := {unparen(env[n].expr)}")
                     env[n] = LoweredValue(f"v_{n.name}", Kind.COMPUTED)
