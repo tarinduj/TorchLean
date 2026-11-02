@@ -8,13 +8,13 @@ import textwrap
 
 import torch
 
-_printer_spec = importlib.util.spec_from_file_location(
-    "op_printer", pathlib.Path(__file__).with_name("op_printer.py")
+_fx_emitter_spec = importlib.util.spec_from_file_location(
+    "fx_emitter", pathlib.Path(__file__).with_name("fx_emitter.py")
 )
-op_printer = importlib.util.module_from_spec(_printer_spec)
-_printer_spec.loader.exec_module(op_printer)
+fx_emitter = importlib.util.module_from_spec(_fx_emitter_spec)
+_fx_emitter_spec.loader.exec_module(fx_emitter)
 
-refuse, invalid = op_printer.refuse, op_printer.invalid
+refuse, invalid = fx_emitter.refuse, fx_emitter.invalid
 
 
 def _indent(text: str, spaces: int) -> str:
@@ -55,7 +55,7 @@ def _tile_args(blocks: list[int], bounds: list[str]) -> str:
 def _doc_comment(text: str) -> str:
     """Lay out `text` as a Lean doc comment whose lines fit in the printer's width."""
     lines = textwrap.wrap(
-        text, width=op_printer.WIDTH - 7, break_long_words=False, break_on_hyphens=False
+        text, width=fx_emitter.WIDTH - 7, break_long_words=False, break_on_hyphens=False
     )
     lines = ["/-- " + lines[0]] + ["    " + line for line in lines[1:]]
     return "\n".join(lines) + " -/"
@@ -91,13 +91,13 @@ def _assigned_names(statement) -> list[str] | None:
     return names if len(set(names)) == len(names) else None
 
 
-class Emitter(op_printer.FxEmitter):
+class Emitter(fx_emitter.FxEmitter):
     """Check a captured Helion kernel and print its device IR as a Lean definition."""
 
     def __init__(self, kernel, example_args: tuple, bridge):
         """Capture device IR and validate the inputs and host-code pattern.
 
-        Require tensor arguments with symbolic sizes, named by `op_printer.input_name` and `size_name`.
+        Require tensor arguments with symbolic sizes, named by `fx_emitter.input_name` and `size_name`.
         The shared emitter replaces `bridge._DIM_NAMES` with this kernel's size-name map.
         """
         if kernel.settings.static_shapes:
@@ -115,7 +115,7 @@ class Emitter(op_printer.FxEmitter):
         if len(params) != len(example_args):
             refuse("only calls that pass every parameter are supported")
         # Python argument name -> Lean input name, in signature order.
-        self.lean_inputs = {name: op_printer.input_name(i) for i, name in enumerate(params)}
+        self.lean_inputs = {name: fx_emitter.input_name(i) for i, name in enumerate(params)}
         # Name each size symbol by first appearance; sizes Helion shares between inputs share a name.
         dimension_names, self.input_shapes = {}, {}
         for name, fake in zip(params, bound_kernel.fake_args):
@@ -124,7 +124,7 @@ class Emitter(op_printer.FxEmitter):
             if not all(isinstance(size, torch.SymInt) for size in fake.shape):
                 refuse("only symbolic sizes are supported")
             for size in fake.shape:
-                dimension_names.setdefault(size.node.expr, op_printer.size_name(len(dimension_names)))
+                dimension_names.setdefault(size.node.expr, fx_emitter.size_name(len(dimension_names)))
             self.input_shapes[self.lean_inputs[name]] = [dimension_names[size.node.expr] for size in fake.shape]
         self.dim_names = list(dimension_names.values())
         self.block_ids = {
@@ -161,16 +161,16 @@ class Emitter(op_printer.FxEmitter):
         # One slot per loop result.
         for info in self.device_ir.graphs:
             for loop in info.graph.nodes:
-                if op_printer.op_name(loop) == "_for_loop":
+                if fx_emitter.op_name(loop) == "_for_loop":
                     results = self.device_ir.graphs[loop.args[0]].graph.output_node().args[0]
                     carries[loop] = [None] * len(results)
         # Fill each slot from its phi.
         for info in self.device_ir.graphs:
             for phi in info.graph.nodes:
-                if op_printer.op_name(phi) != "_phi":
+                if fx_emitter.op_name(phi) != "_phi":
                     continue
                 acc, result = phi.args
-                if op_printer.op_name(result) != "getitem" or op_printer.op_name(result.args[0]) != "_for_loop":
+                if fx_emitter.op_name(result) != "getitem" or fx_emitter.op_name(result.args[0]) != "_for_loop":
                     continue
                 loop, index = result.args
                 arguments = loop.args[3]
@@ -356,7 +356,7 @@ class Emitter(op_printer.FxEmitter):
 
     def aten(self, ir_node, values: dict) -> str:
         """Translate masked `amax`; send other ATen ops to the shared printer."""
-        if op_printer.op_name(ir_node) != "amax.default":
+        if fx_emitter.op_name(ir_node) != "amax.default":
             return super().aten(ir_node, values)
         operand = ir_node.args[0]
         dims = ir_node.args[1] if len(ir_node.args) > 1 else ir_node.kwargs.get("dim", [])
@@ -365,7 +365,7 @@ class Emitter(op_printer.FxEmitter):
         # and the `amax` become one `maskedMax`.
         if (
             not isinstance(operand, torch.fx.Node)
-            or op_printer.op_name(operand) != "_mask_to"
+            or fx_emitter.op_name(operand) != "_mask_to"
             or operand.args[1] != float("-inf")
         ):
             refuse("only amax over an input masked to -inf is supported")
@@ -388,7 +388,7 @@ class Emitter(op_printer.FxEmitter):
         tensor operations go through the shared FX walker and op printer.
         """
         args = ir_node.args
-        op = op_printer.op_name(ir_node)
+        op = fx_emitter.op_name(ir_node)
         if op == "_get_symnode":
             values[ir_node] = self.sym(ir_node.meta["val"])
         elif op == "_new_var":
@@ -409,19 +409,19 @@ class Emitter(op_printer.FxEmitter):
         elif op == "_for_loop":
             self._emit_inner_loop(ir_node, values, context)
         elif op == "getitem":
-            if op_printer.op_name(args[0]) != "_for_loop":
+            if fx_emitter.op_name(args[0]) != "_for_loop":
                 refuse("only getitem of a loop's result is supported")
             loop, index = args
             values[ir_node] = _component(values[loop], index, len(self.carried_arguments[loop]))
         elif op == "_phi":
             before, after = args
-            if op_printer.op_name(after) != "getitem" or op_printer.op_name(after.args[0]) != "_for_loop":
+            if fx_emitter.op_name(after) != "getitem" or fx_emitter.op_name(after.args[0]) != "_for_loop":
                 refuse("only phis after loops are supported")
             values[ir_node] = values[after]
         elif op == "_mask_to":
             if args[1] == float("-inf"):
                 users = list(ir_node.users)
-                if len(users) != 1 or op_printer.op_name(users[0]) != "amax.default":
+                if len(users) != 1 or fx_emitter.op_name(users[0]) != "amax.default":
                     refuse("_mask_to(-inf) is supported only as the input of amax")
                 values[ir_node] = None   # printed by its amax
             elif args[1] == 0:
@@ -494,7 +494,7 @@ class Emitter(op_printer.FxEmitter):
             accumulator = f"acc{block_id}"
             for i, argument in enumerate(carried):
                 arguments[placeholders[argument]] = _component(accumulator, i, len(carried))
-            initial = f"({', '.join(op_printer.unparen(values[initial_values[a]]) for a in carried)})"
+            initial = f"({', '.join(fx_emitter.unparen(values[initial_values[a]]) for a in carried)})"
             body = self.emit_graph(
                 loop_graph.graph, {**values, **arguments}, {"nest": nest, "state": None, "lets": []}
             )
@@ -530,7 +530,7 @@ class Emitter(op_printer.FxEmitter):
         positivity_hypotheses = [
             f"(h{dimension} : 0 < {dimension})" for dimension in sorted(self.hyps)
         ]
-        signature = op_printer.print_def(
+        signature = fx_emitter.print_def(
             "noncomputable def kernel",
             [
                 f"({' '.join(self.dim_names)} {block_parameters} : ℕ)",
@@ -553,18 +553,18 @@ class Emitter(op_printer.FxEmitter):
         docstring = _doc_comment(
             f"Run the Helion `{self.fn_name}` kernel on {inputs}, writing into the output buffer `out0`.{scope}"
         )
-        if any(len(line) > op_printer.WIDTH for line in docstring.splitlines()):
+        if any(len(line) > fx_emitter.WIDTH for line in docstring.splitlines()):
             docstring = _doc_comment(
                 f"Run the Helion kernel on {inputs}, writing into the output buffer `out0`.{scope}"
             )
         return (
-            f"-- Generated from {source} by NN/Runtime/Helion/helion_frontend.py; do not edit.\n"
+            f"-- Generated from {source} by NN/Runtime/Helion/helion_emitter.py; do not edit.\n"
             "import NN.Runtime.Helion.Tile\n\n"
             "open Spec TorchLean TorchLean.Helion\n\n"
             f"namespace {name}\n\n"
             f"{docstring}\n"
             f"{signature}\n"
             f"{grid_loops}"
-            f"{op_printer.wrap_lines(_indent(body, 2 * len(self.grid_blocks) + 2))}\n\n"
+            f"{fx_emitter.wrap_lines(_indent(body, 2 * len(self.grid_blocks) + 2))}\n\n"
             f"end {name}\n"
         )
