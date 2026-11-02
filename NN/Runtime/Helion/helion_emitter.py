@@ -362,16 +362,16 @@ class Emitter(fx_emitter.FxEmitter):
                 invalid("index is not the tile of an enclosing loop for that axis")
         return blocks, bounds, tiles
 
-    def aten(self, ir_node, values: dict) -> str:
+    def aten(self, ir_node, env: dict) -> str:
         """Translate ops on extended reals and masked `amax`; send other ATen ops to the shared printer."""
         if any(operand in self.ereal for operand in ir_node.all_input_nodes):
-            return self._ereal_op(ir_node, values)
+            return self._ereal_op(ir_node, env)
         elif fx_emitter.op_name(ir_node) == "amax.default":
-            return self._masked_amax(ir_node, values)
+            return self._masked_amax(ir_node, env)
         else:
-            return super().aten(ir_node, values)
+            return super().aten(ir_node, env)
 
-    def _masked_amax(self, ir_node, values: dict) -> str:
+    def _masked_amax(self, ir_node, env: dict) -> str:
         """Print `amax` over a tile masked to -inf as `maskedMax`.
 
         Python:
@@ -395,12 +395,12 @@ class Emitter(fx_emitter.FxEmitter):
         kind = fx_emitter.amax_kind(ir_node)
         axis, keepdim = kind["axes"][0], kind["keepdim"]
         blocks, bounds, tiles = self._tile_layout(operand)
-        original = values[operand.args[0]]  # The tile before `_mask_to`; `maskedMax` skips its masked lanes.
+        original = env[operand.args[0]]  # The tile before `_mask_to`; `maskedMax` skips its masked lanes.
         call = f"(maskedMax {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] {axis} {original})"
         # Restore the singleton axis when keepdim=True.
         return self.reshape(call, self.shape(ir_node)) if keepdim else call
 
-    def _ereal_op(self, ir_node, values: dict) -> str:
+    def _ereal_op(self, ir_node, env: dict) -> str:
         """Print an op on extended reals: `maximum` and subtraction stay in `EReal`, `exp` returns to `ℝ`.
 
         Python:
@@ -418,10 +418,10 @@ class Emitter(fx_emitter.FxEmitter):
         """
         op = fx_emitter.op_name(ir_node)
         # Promote real operands; the result stays extended.
-        promoted = {arg: values[arg] if arg in self.ereal else f"(toEReal {values[arg]})"
+        promoted = {arg: env[arg] if arg in self.ereal else f"(toEReal {env[arg]})"
                     for arg in ir_node.args}
         if op == "exp.default":
-            return f"(expE {values[ir_node.args[0]]})"
+            return f"(expE {env[ir_node.args[0]]})"
         elif op == "maximum.default":
             operands = self.elementwise_operands(ir_node, ir_node.args, promoted)
             # The max is `⊥` only where every operand is.
@@ -438,7 +438,7 @@ class Emitter(fx_emitter.FxEmitter):
         else:
             refuse("extended reals are supported only in maximum, subtraction and exp")
 
-    def node(self, ir_node, values: dict, context: dict):
+    def node(self, ir_node, env: dict, context: dict):
         """Translate a Helion-specific IR node into Lean.
 
         Tile loops, carried values, loads, and stores are handled here. ATen
@@ -447,22 +447,22 @@ class Emitter(fx_emitter.FxEmitter):
         args = ir_node.args
         op = fx_emitter.op_name(ir_node)
         if op == "_get_symnode":
-            values[ir_node] = self.sym(ir_node.meta["val"])
+            env[ir_node] = self.sym(ir_node.meta["val"])
         elif op == "_new_var":
-            values[ir_node] = values[args[0]]
+            env[ir_node] = env[args[0]]
             if args[0] in self.ereal:
                 self.ereal[ir_node] = self.ereal[args[0]]
         elif op == "_host_tensor":
             if args[0] not in self.lean_inputs and args[0] != self.output_name:
                 refuse("only the arguments and the output are supported in device code")
-            values[ir_node] = self.lean_inputs.get(args[0], ("OUT",))
+            env[ir_node] = self.lean_inputs.get(args[0], ("OUT",))
         elif op == "full":
             shape = ", ".join(self.shape(ir_node))
             if args[1] == 0:
-                values[ir_node] = f"(Tensor.zeros [{shape}])"
+                env[ir_node] = f"(Tensor.zeros [{shape}])"
             elif args[1] == float("-inf"):
                 # ℝ has no -inf: it is the extended real `⊥`.
-                values[ir_node] = f"(Tensor.full [{shape}] (⊥ : EReal))"
+                env[ir_node] = f"(Tensor.full [{shape}] (⊥ : EReal))"
                 self.ereal[ir_node] = True
             else:
                 refuse("only 0 and -inf fills are supported")
@@ -470,16 +470,16 @@ class Emitter(fx_emitter.FxEmitter):
             # `v[:, None]` adds a singleton axis: reshape to the captured shape.
             if not all(index == slice(None) or index is None for index in args[1]):
                 refuse("only subscripts with `:` and `None` are supported")
-            values[ir_node] = self.reshape(values[args[0]], self.shape(ir_node))
+            env[ir_node] = self.reshape(env[args[0]], self.shape(ir_node))
             if args[0] in self.ereal:
                 self.ereal[ir_node] = self.ereal[args[0]]
         elif op == "_for_loop":
-            self._emit_inner_loop(ir_node, values, context)
+            self._emit_inner_loop(ir_node, env, context)
         elif op == "getitem":
             if fx_emitter.op_name(args[0]) != "_for_loop":
                 refuse("only getitem of a loop's result is supported")
             loop, index = args
-            values[ir_node] = _component(values[loop], index, len(self.carried_arguments[loop]))
+            env[ir_node] = _component(env[loop], index, len(self.carried_arguments[loop]))
             result = self._loop_results(loop)[index]
             if result in self.ereal:
                 self.ereal[ir_node] = self.ereal[result]
@@ -487,7 +487,7 @@ class Emitter(fx_emitter.FxEmitter):
             before, after = args
             if fx_emitter.op_name(after) != "getitem" or fx_emitter.op_name(after.args[0]) != "_for_loop":
                 refuse("only phis after loops are supported")
-            values[ir_node] = values[after]
+            env[ir_node] = env[after]
             if after in self.ereal:
                 self.ereal[ir_node] = self.ereal[after]
         elif op == "_mask_to":
@@ -497,26 +497,26 @@ class Emitter(fx_emitter.FxEmitter):
                 users = list(ir_node.users)
                 if len(users) != 1 or fx_emitter.op_name(users[0]) != "amax.default":
                     refuse("_mask_to(-inf) is supported only as the input of amax")
-                values[ir_node] = None   # printed by its amax
+                env[ir_node] = None   # printed by its amax
             elif args[1] == 0:
                 blocks, bounds, tiles = self._tile_layout(ir_node)
-                values[ir_node] = f"(maskTo {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] 0 {values[args[0]]})"
+                env[ir_node] = f"(maskTo {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] 0 {env[args[0]]})"
             else:
                 refuse("only _mask_to with fill 0 or -inf is supported")
         elif op == "load":
             source, indices = args[0], args[1]
-            if values[source] not in self.input_shapes:
+            if env[source] not in self.input_shapes:
                 refuse("only loads from an argument are supported")
             if len(args) > 2 and args[2] is not None:
                 refuse("only loads without an extra mask are supported")
             blocks, bounds, tiles = self._indexed_tile_layout(ir_node, indices, context)
             self._record_in_bounds(bounds, self.shape(source))
-            values[ir_node] = f"(loadTile {_tile_args(blocks, bounds)} 0 {values[source]} ![{', '.join(tiles)}])"
+            env[ir_node] = f"(loadTile {_tile_args(blocks, bounds)} 0 {env[source]} ![{', '.join(tiles)}])"
         elif op == "store":
             destination, indices, value = args[0], args[1], args[2]
             if context["state"] is None:
                 refuse("only stores outside loops that carry a value are supported")
-            if values[destination] != ("OUT",):
+            if env[destination] != ("OUT",):
                 refuse("only stores into the output are supported")
             if len(args) > 3 and args[3] is not None:
                 refuse("only stores without an extra mask are supported")
@@ -529,12 +529,12 @@ class Emitter(fx_emitter.FxEmitter):
             self._record_in_bounds(bounds, self.output_shape)
             self.store_count += 1
             context["state"] = (
-                f"(storeTile {_tile_args(blocks, bounds)} {context['state']} ![{', '.join(tiles)}] {values[value]})"
+                f"(storeTile {_tile_args(blocks, bounds)} {context['state']} ![{', '.join(tiles)}] {env[value]})"
             )
         else:
             refuse(f"device op {op} is not supported")
 
-    def _emit_inner_loop(self, ir_node, values: dict, context: dict):
+    def _emit_inner_loop(self, ir_node, env: dict, context: dict):
         """Emit an inner `hl.tile` loop as `forTiles`."""
         graph_id, begin, end, initial_values = ir_node.args[:4]
         loop_graph = self.device_ir.graphs[graph_id]
@@ -553,14 +553,14 @@ class Emitter(fx_emitter.FxEmitter):
         # The loop's arguments are the outside values its body reads; it returns the ones it updates.
         # The arguments the loop updates; the others are only read.
         carried = self.carried_arguments[ir_node]
-        arguments = {p: values[v] for p, v in zip(placeholders, initial_values)}
+        arguments = {p: env[v] for p, v in zip(placeholders, initial_values)}
         self.ereal |= {p: self.ereal[v] for p, v in zip(placeholders, initial_values) if v in self.ereal}
         if len(carried) == 0:
             # A storing loop: each iteration writes into the output and only reads its arguments.
             if context["state"] is None:
                 refuse("only storing loops outside loops that carry a value are supported")
             body = self.emit_graph(
-                loop_graph.graph, {**values, **arguments}, {"nest": nest, "state": "out", "lets": []}
+                loop_graph.graph, {**env, **arguments}, {"nest": nest, "state": "out", "lets": []}
             )
             context["state"] = (
                 f"(forTiles {extent} B{block_id} {context['state']} fun tile{block_id} out =>\n"
@@ -571,9 +571,9 @@ class Emitter(fx_emitter.FxEmitter):
             accumulator = f"acc{block_id}"
             for i, argument in enumerate(carried):
                 arguments[placeholders[argument]] = _component(accumulator, i, len(carried))
-            initial = f"({', '.join(fx_emitter.unparen(values[initial_values[a]]) for a in carried)})"
+            initial = f"({', '.join(fx_emitter.unparen(env[initial_values[a]]) for a in carried)})"
             body = self.emit_graph(
-                loop_graph.graph, {**values, **arguments}, {"nest": nest, "state": None, "lets": []}
+                loop_graph.graph, {**env, **arguments}, {"nest": nest, "state": None, "lets": []}
             )
             # Each carried value must keep its type: real, or extended.
             results = self._loop_results(ir_node)
@@ -594,7 +594,7 @@ class Emitter(fx_emitter.FxEmitter):
                 f"let {accumulator} := forTiles {extent} B{block_id} {initial} "
                 f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)}"
             )
-            values[ir_node] = accumulator
+            env[ir_node] = accumulator
 
     def emit(self, name: str, source: str) -> str:
         """Emit the complete Lean module for the outer `hl.tile` grid loop and its body."""
