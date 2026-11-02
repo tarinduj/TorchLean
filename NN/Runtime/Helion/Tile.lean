@@ -1,6 +1,7 @@
 import NN.IR.Semantics
 import NN.Spec.Core.Context.Real
 import Mathlib.Data.Fin.VecNotation
+import Mathlib.Analysis.SpecialFunctions.Log.ERealExp
 
 /-!
 Loops over fixed-size tiles, reads tiles of input tensors, and writes tiles of an output tensor.
@@ -105,5 +106,14 @@ def maskedMax [Max α] [Zero α] (blockSizes : List ℕ) (bounds tileIdx : Fin b
     let entries := ((List.range (blockSizes.get axis)).filter inMask).map fun j =>
       getOrFill 0 v (lane j)
     entries.max?.getD 0
+
+/-- Promote a real tensor to extended reals. -/
+def toEReal {s : Shape} (t : Tensor ℝ s) : Tensor EReal s :=
+  Tensor.map (fun r : ℝ => (r : EReal)) t
+
+/-- Exponentiate an extended-real tensor into a real one: `exp ⊥ = 0`, as Helion's `exp(-inf)`.
+An entry `⊤` gives `0` where Helion gives `inf`. -/
+noncomputable def expE {s : Shape} (t : Tensor EReal s) : Tensor ℝ s :=
+  Tensor.map (fun x : EReal => (EReal.exp x).toReal) t
 
 end TorchLean.Helion

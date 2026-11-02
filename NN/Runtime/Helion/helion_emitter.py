@@ -136,6 +136,8 @@ class Emitter(fx_emitter.FxEmitter):
         self.store_count = 0
         self.in_bounds = []   # loop bound ≤ tensor size, for every load and store; trivial ones omitted
         self.full_slices = []  # axis size ≤ block size, for every full slice (`:`)
+        # IR nodes whose Lean value is an extended-real tensor; each entry is `⊥` or finite, never `⊤`.
+        self.ereal = set()
         self.carried_arguments = self._carried_arguments()
 
     def _carried_arguments(self) -> dict:
@@ -355,9 +357,26 @@ class Emitter(fx_emitter.FxEmitter):
         return blocks, bounds, tiles
 
     def aten(self, ir_node, values: dict) -> str:
-        """Translate masked `amax`; send other ATen ops to the shared printer."""
-        if fx_emitter.op_name(ir_node) != "amax.default":
+        """Translate ops on extended reals and masked `amax`; send other ATen ops to the shared printer."""
+        if any(operand in self.ereal for operand in ir_node.all_input_nodes):
+            return self._ereal_op(ir_node, values)
+        elif fx_emitter.op_name(ir_node) == "amax.default":
+            return self._masked_amax(ir_node, values)
+        else:
             return super().aten(ir_node, values)
+
+    def _masked_amax(self, ir_node, values: dict) -> str:
+        """Print `amax` over a tile masked to -inf as `maskedMax`.
+
+        Python:
+            x[tile_m, :].amax(1)
+
+        Captured graph:
+            amax(_mask_to(load(x, [block_size_0, block_size_1]), -inf), [1])
+
+        Lean:
+            maskedMax [B0, B1] ![d0, d1] ![tile0, 0] 1 (loadTile …)
+        """
         operand = ir_node.args[0]
         # Accept only an amax whose operand is `_mask_to(…, -inf)`: ℝ has no -inf, so the `_mask_to`
         # and the `amax` become one `maskedMax`.
@@ -375,6 +394,38 @@ class Emitter(fx_emitter.FxEmitter):
         # Restore the singleton axis when keepdim=True.
         return self.reshape(call, self.shape(ir_node)) if keepdim else call
 
+    def _ereal_op(self, ir_node, values: dict) -> str:
+        """Print an op on extended reals: `maximum` stays in `EReal`, `exp` returns to `ℝ`.
+
+        Python:
+            mx = hl.full([tile_m, tile_n], float("-inf"), dtype=x.dtype)
+            mx = torch.maximum(mx, x[tile_m, tile_n])
+            out[tile_m, tile_n] = torch.exp(mx)
+
+        Captured graph:
+            mx = full([block_size_0, block_size_1], -inf)
+            mx_1 = maximum(mx, load(x, [block_size_0, block_size_1]))
+            exp = exp(mx_1)
+
+        Lean:
+            expE (Tensor.map2Spec max (Tensor.full [B0, B1] (⊥ : EReal)) (toEReal (loadTile …)))
+        """
+        op = fx_emitter.op_name(ir_node)
+        if op == "exp.default":
+            return f"(expE {values[ir_node.args[0]]})"
+        elif op == "maximum.default":
+            # Promote real operands; the result stays extended.
+            target = self.shape(ir_node)
+            operands = [
+                self.broadcast(values[arg] if arg in self.ereal else f"(toEReal {values[arg]})",
+                               self.shape(arg), target)
+                for arg in ir_node.args
+            ]
+            self.ereal.add(ir_node)
+            return f"(Tensor.map2Spec max {' '.join(operands)})"
+        else:
+            refuse("extended reals are supported only in maximum and exp")
+
     def node(self, ir_node, values: dict, context: dict):
         """Translate a Helion-specific IR node into Lean.
 
@@ -387,19 +438,29 @@ class Emitter(fx_emitter.FxEmitter):
             values[ir_node] = self.sym(ir_node.meta["val"])
         elif op == "_new_var":
             values[ir_node] = values[args[0]]
+            if args[0] in self.ereal:
+                self.ereal.add(ir_node)
         elif op == "_host_tensor":
             if args[0] not in self.lean_inputs and args[0] != self.output_name:
                 refuse("only the arguments and the output are supported in device code")
             values[ir_node] = self.lean_inputs.get(args[0], ("OUT",))
         elif op == "full":
-            if args[1] != 0:
-                refuse("only zero accumulators are supported")
-            values[ir_node] = f"(Tensor.zeros [{', '.join(self.shape(ir_node))}])"
+            shape = ", ".join(self.shape(ir_node))
+            if args[1] == 0:
+                values[ir_node] = f"(Tensor.zeros [{shape}])"
+            elif args[1] == float("-inf"):
+                # ℝ has no -inf: it is the extended real `⊥`.
+                values[ir_node] = f"(Tensor.full [{shape}] (⊥ : EReal))"
+                self.ereal.add(ir_node)
+            else:
+                refuse("only 0 and -inf fills are supported")
         elif op == "subscript":
             # `v[:, None]` adds a singleton axis: reshape to the captured shape.
             if not all(index == slice(None) or index is None for index in args[1]):
                 refuse("only subscripts with `:` and `None` are supported")
             values[ir_node] = self.reshape(values[args[0]], self.shape(ir_node))
+            if args[0] in self.ereal:
+                self.ereal.add(ir_node)
         elif op == "_for_loop":
             self._emit_inner_loop(ir_node, values, context)
         elif op == "getitem":
@@ -407,12 +468,18 @@ class Emitter(fx_emitter.FxEmitter):
                 refuse("only getitem of a loop's result is supported")
             loop, index = args
             values[ir_node] = _component(values[loop], index, len(self.carried_arguments[loop]))
+            if loop.args[3][self.carried_arguments[loop][index]] in self.ereal:
+                self.ereal.add(ir_node)
         elif op == "_phi":
             before, after = args
             if fx_emitter.op_name(after) != "getitem" or fx_emitter.op_name(after.args[0]) != "_for_loop":
                 refuse("only phis after loops are supported")
             values[ir_node] = values[after]
+            if after in self.ereal:
+                self.ereal.add(ir_node)
         elif op == "_mask_to":
+            if args[0] in self.ereal:
+                refuse("only masking real values is supported")
             if args[1] == float("-inf"):
                 users = list(ir_node.users)
                 if len(users) != 1 or fx_emitter.op_name(users[0]) != "amax.default":
@@ -440,6 +507,8 @@ class Emitter(fx_emitter.FxEmitter):
                 refuse("only stores into the output are supported")
             if len(args) > 3 and args[3] is not None:
                 refuse("only stores without an extra mask are supported")
+            if value in self.ereal:
+                refuse("only storing real values is supported")
             blocks, bounds, tiles = self._indexed_tile_layout(value, indices, context)
             if [b for b, t in zip(blocks, tiles) if t != "0"] != context["nest"]:
                 refuse("only stores at the enclosing loops' tiles, in order, are supported")
@@ -472,6 +541,7 @@ class Emitter(fx_emitter.FxEmitter):
         # The arguments the loop updates; the others are only read.
         carried = self.carried_arguments[ir_node]
         arguments = {p: values[v] for p, v in zip(placeholders, initial_values)}
+        self.ereal |= {p for p, v in zip(placeholders, initial_values) if v in self.ereal}
         if len(carried) == 0:
             # A storing loop: each iteration writes into the output and only reads its arguments.
             if context["state"] is None:
@@ -492,6 +562,10 @@ class Emitter(fx_emitter.FxEmitter):
             body = self.emit_graph(
                 loop_graph.graph, {**values, **arguments}, {"nest": nest, "state": None, "lets": []}
             )
+            # Each carried value must keep its type: real, or extended.
+            results = loop_graph.graph.output_node().args[0]
+            if any((r in self.ereal) != (initial_values[a] in self.ereal) for r, a in zip(results, carried)):
+                refuse("only carried values that stay real or stay extended are supported")
             context["lets"].append(
                 f"let {accumulator} := forTiles {extent} B{block_id} {initial} "
                 f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)}"
