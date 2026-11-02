@@ -359,8 +359,6 @@ class Emitter(fx_emitter.FxEmitter):
         if fx_emitter.op_name(ir_node) != "amax.default":
             return super().aten(ir_node, values)
         operand = ir_node.args[0]
-        dims = ir_node.args[1] if len(ir_node.args) > 1 else ir_node.kwargs.get("dim", [])
-        keepdim = ir_node.args[2] if len(ir_node.args) > 2 else ir_node.kwargs.get("keepdim", False)
         # Accept only an amax whose operand is `_mask_to(…, -inf)`: ℝ has no -inf, so the `_mask_to`
         # and the `amax` become one `maskedMax`.
         if (
@@ -369,12 +367,8 @@ class Emitter(fx_emitter.FxEmitter):
             or operand.args[1] != float("-inf")
         ):
             refuse("only amax over an input masked to -inf is supported")
-        rank = len(operand.meta["val"].shape)
-        if len(dims) != 1:
-            refuse("only amax over one axis is supported")
-        if not -rank <= dims[0] < rank:
-            invalid(f"amax axis {dims[0]} is out of range for a rank-{rank} tensor")
-        axis = dims[0] % rank  # Convert negative axis numbering to nonnegative.
+        kind = fx_emitter.amax_kind(ir_node)
+        axis, keepdim = kind["axes"][0], kind["keepdim"]
         blocks, bounds, tiles = self._tile_layout(operand)
         original = values[operand.args[0]]  # The tile before `_mask_to`; `maskedMax` skips its masked lanes.
         call = f"(maskedMax {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] {axis} {original})"

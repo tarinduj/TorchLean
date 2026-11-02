@@ -155,7 +155,24 @@ def print_op(kind: dict, args: list[str], shapes: list[list[str]]) -> tuple[str,
         return f"(Activation.softmaxSpec 1 {args[0]})", set()
     if kind == {"kind": "reduce_sum", "axes": [1], "keepdim": False} and len(shapes[0]) == 2:
         return f"(Tensor.reduceSum 1 {args[0]} (.succ (Shape.hasNonemptyAxisZeroOfPos h{shapes[0][1]}).proof))", {shapes[0][1]}
+    if kind == {"kind": "reduce_max", "axes": [1], "keepdim": False} and len(shapes[0]) == 2:
+        return f"(Tensor.reduceMax 1 {args[0]} (.succ (Shape.hasNonemptyAxisZeroOfPos h{shapes[0][1]}).proof))", {shapes[0][1]}
     refuse(f"op {kind} is not supported")
+
+
+def amax_kind(n) -> dict:
+    """Read `amax` as a max over one axis.
+
+    `x.amax(dim=-1, keepdim=True)` of a matrix → `{"kind": "reduce_max", "axes": [1], "keepdim": True}`
+    """
+    dims = n.args[1] if len(n.args) > 1 else n.kwargs.get("dim", [])
+    keepdim = n.args[2] if len(n.args) > 2 else n.kwargs.get("keepdim", False)
+    rank = len(n.args[0].meta["val"].shape)
+    if len(dims) != 1:
+        refuse("only amax over one axis is supported")
+    if not -rank <= dims[0] < rank:
+        invalid(f"expected an amax axis in [-{rank}, {rank})")
+    return {"kind": "reduce_max", "axes": [dims[0] % rank], "keepdim": bool(keepdim)}
 
 
 class FxEmitter:
@@ -183,7 +200,10 @@ class FxEmitter:
         shape, and a `keepdim` reduction is reshaped to it.
         """
         operands = self.bridge._node_refs((n.args, n.kwargs), {m: m for m in n.all_input_nodes})
-        if op_name(n) in _DIRECT_ONLY_KINDS:
+        if op_name(n) == "amax.default":
+            # The IR has no max over an axis either; it prints as `Tensor.reduceMax`.
+            kind = amax_kind(n)
+        elif op_name(n) in _DIRECT_ONLY_KINDS:
             kind = _DIRECT_ONLY_KINDS[op_name(n)]
         else:
             kind = self.bridge._lower_kind(n)
