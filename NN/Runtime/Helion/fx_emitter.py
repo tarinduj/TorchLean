@@ -208,9 +208,8 @@ class FxEmitter:
         else:
             kind = self.bridge._lower_kind(n)
         if kind["kind"] in _BINARY_ELEMENTWISE_KINDS:
-            target = self.shape(n)
-            args = [self.broadcast(env[p], self.shape(p), target) for p in operands]
-            shapes = [target] * len(operands)
+            args = self.elementwise_operands(n, operands, env)
+            shapes = [self.shape(n)] * len(operands)
         else:
             args, shapes = [env[p] for p in operands], [self.shape(p) for p in operands]
         # TorchLean reductions drop the axis; reshape below restores it for keepdim=True.
@@ -220,6 +219,11 @@ class FxEmitter:
         call, positive = print_op(kind, args, shapes)
         self.hyps |= positive
         return self.reshape(call, self.shape(n)) if keepdim else call
+
+    def elementwise_operands(self, n, operands, env: dict) -> list[str]:
+        """Broadcast each operand of elementwise `n`, as printed in `env`, to `n`'s shape."""
+        target = self.shape(n)
+        return [self.broadcast(env[p], self.shape(p), target) for p in operands]
 
     def broadcast(self, value: str, shape: list[str], target: list[str]) -> str:
         """Broadcast `value` between equal-rank shapes; each axis of `shape` must match `target` or be `1`."""

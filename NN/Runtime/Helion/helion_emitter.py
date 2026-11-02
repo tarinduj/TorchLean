@@ -415,12 +415,9 @@ class Emitter(fx_emitter.FxEmitter):
             return f"(expE {values[ir_node.args[0]]})"
         elif op == "maximum.default":
             # Promote real operands; the result stays extended.
-            target = self.shape(ir_node)
-            operands = [
-                self.broadcast(values[arg] if arg in self.ereal else f"(toEReal {values[arg]})",
-                               self.shape(arg), target)
-                for arg in ir_node.args
-            ]
+            promoted = {arg: values[arg] if arg in self.ereal else f"(toEReal {values[arg]})"
+                        for arg in ir_node.args}
+            operands = self.elementwise_operands(ir_node, ir_node.args, promoted)
             self.ereal.add(ir_node)
             return f"(Tensor.map2Spec max {' '.join(operands)})"
         else:
