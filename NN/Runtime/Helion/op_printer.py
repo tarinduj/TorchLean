@@ -69,11 +69,37 @@ def _outer_parens(expr: str) -> bool:
     return True
 
 
+def _tuple_components(expr: str) -> list[str]:
+    """Split printed tuple text into its values, e.g. `"(a, b, c)"` → `["a", "b", "c"]`."""
+    if not _outer_parens(expr):
+        return [expr]
+    parts, cur, depth = [], "", 0
+    for ch in expr[1:-1]:
+        depth += ch in "([{⟨"
+        depth -= ch in ")]}⟩"
+        if ch == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    return parts + [cur.strip()]
+
+
 def wrap_expr(expr: str, indent: int) -> list[str]:
     """Lay out an application in lines of at most WIDTH, putting arguments that do not fit below."""
     pad = " " * indent
     if indent + len(expr) <= WIDTH:
         return [pad + expr]
+    components = _tuple_components(expr)
+    if len(components) > 1:
+        # A tuple: each component starts a line.
+        lines = []
+        for component in components:
+            lines += wrap_expr(component, indent + 1)
+            lines[-1] += ","
+        lines[0] = pad + "(" + lines[0].lstrip()
+        lines[-1] = lines[-1][:-1] + ")"
+        return lines
     if _outer_parens(expr):
         lines = wrap_expr(expr[1:-1], indent + 1)
         lines = [pad + "(" + lines[0].lstrip()] + [ln[1:] for ln in lines[1:]]
@@ -201,9 +227,9 @@ class FxEmitter:
             if n.op == "output":
                 outs = n.args[0]
                 if outs is not None and len(outs) > 0:
-                    if not (isinstance(outs, (list, tuple)) and len(outs) == 1):
-                        refuse("graph returning more than one tensor is not supported")
-                    result = env[outs[0]]
+                    # Several results form a tuple, e.g. the values a loop carries.
+                    result = unparen(env[outs[0]]) if len(outs) == 1 else (
+                        f"({', '.join(unparen(env[out]) for out in outs)})")
             elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in SYM_OPS:
                 env[n] = self.aten(n, env)
                 if len(n.users) > 1:
@@ -213,4 +239,4 @@ class FxEmitter:
                 env[n] = self.sym(n.meta["val"])
             else:
                 self.node(n, env, ctx)
-        return "\n".join(ctx["lets"] + [unparen(ctx["state"] if result is None else result)])
+        return "\n".join(ctx["lets"] + [unparen(ctx["state"]) if result is None else result])

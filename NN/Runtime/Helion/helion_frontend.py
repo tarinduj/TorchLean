@@ -21,6 +21,32 @@ def _indent(text: str, spaces: int) -> str:
     return "\n".join(" " * spaces + line for line in text.splitlines())
 
 
+def _component(name: str, i: int, count: int) -> str:
+    """Print how to read result `i` from a loop's final value.
+
+    Python:
+        for tile_n in hl.tile(n):
+            acc_x = acc_x + x[tile_m, tile_n].sum(1)
+            acc_y = acc_y + y[tile_m, tile_n].sum(1)
+
+    Captured graph:
+        loop = _for_loop(body, [0], [n], [acc_x, acc_y])   # body returns [next_x, next_y]
+        getitem(loop, 0)
+        getitem(loop, 1)
+
+    Lean:
+        let acc1 := forTiles ... (zeros, zeros) ...
+        acc1.1   -- final acc_x
+        acc1.2   -- final acc_y
+
+    Lean has only pairs, so a triple `(a, b, c)` is really `(a, (b, c))`, and its parts are
+    `.1`, `.2.1` and `.2.2`.
+    """
+    if count == 1:
+        return name
+    return name + ".2" * i + ("" if i == count - 1 else ".1")
+
+
 def _tile_args(blocks: list[int], bounds: list[str]) -> str:
     """Print a tile's block sizes and loop bounds, the first arguments of the tile ops: `[B0, B1] ![d0, d1]`."""
     return f"[{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}]"
@@ -385,9 +411,8 @@ class Emitter(op_printer.FxEmitter):
         elif op == "getitem":
             if op_printer.op_name(args[0]) != "_for_loop":
                 refuse("only getitem of a loop's result is supported")
-            if len(self.carried_arguments[args[0]]) != 1:
-                refuse("only loops with one result are supported")
-            values[ir_node] = values[args[0]]
+            loop, index = args
+            values[ir_node] = _component(values[loop], index, len(self.carried_arguments[loop]))
         elif op == "_phi":
             before, after = args
             if op_printer.op_name(after) != "getitem" or op_printer.op_name(after.args[0]) != "_for_loop":
@@ -466,15 +491,15 @@ class Emitter(op_printer.FxEmitter):
             )
         else:
             # A carrying loop, e.g. an accumulator.
-            if len(carried) != 1:
-                refuse("only inner loops carrying one value are supported")
             accumulator = f"acc{block_id}"
-            arguments[placeholders[carried[0]]] = accumulator
+            for i, argument in enumerate(carried):
+                arguments[placeholders[argument]] = _component(accumulator, i, len(carried))
+            initial = f"({', '.join(op_printer.unparen(values[initial_values[a]]) for a in carried)})"
             body = self.emit_graph(
                 loop_graph.graph, {**values, **arguments}, {"nest": nest, "state": None, "lets": []}
             )
             context["lets"].append(
-                f"let {accumulator} := forTiles {extent} B{block_id} {values[initial_values[carried[0]]]} "
+                f"let {accumulator} := forTiles {extent} B{block_id} {initial} "
                 f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)}"
             )
             values[ir_node] = accumulator
