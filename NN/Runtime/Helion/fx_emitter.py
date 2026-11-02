@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 
 import torch
 
@@ -189,6 +190,27 @@ class Context:
     lets: list[str] = dataclasses.field(default_factory=list)  # bindings before the body's result
 
 
+class Kind(enum.Enum):
+    """What a graph node's value represents."""
+    COMPUTED = enum.auto()  # computed by the graph, e.g. a loaded tile or a sum
+    INPUT = enum.auto()  # an argument tensor, e.g. `x0`; device code only loads from it
+    OUTPUT = enum.auto()  # the output tensor; device code only stores into it
+    SIZE = enum.auto()  # a symbolic size
+    FUSED = enum.auto()  # printed by its user, e.g. `_mask_to(-inf)` inside its `amax`
+
+
+@dataclasses.dataclass(frozen=True)
+class LoweredValue:
+    """A graph node's Lean expression and what it represents.
+
+    Kernel argument: `LoweredValue("x0", Kind.INPUT)`.
+    Computed sum: `LoweredValue("(Tensor.addSpec x0 x1)", Kind.COMPUTED)`.
+    Output buffer: `LoweredValue(None, Kind.OUTPUT)`.
+    """
+    expr: str | None  # Lean text; None for output buffers and nodes printed by their users
+    kind: Kind
+
+
 class FxEmitter:
     """Walk an FX graph, printing ATen nodes; subclasses handle other node kinds."""
 
@@ -225,7 +247,7 @@ class FxEmitter:
             args = self.elementwise_operands(n, operands, env)
             shapes = [self.shape(n)] * len(operands)
         else:
-            args, shapes = [env[p] for p in operands], [self.shape(p) for p in operands]
+            args, shapes = [env[p].expr for p in operands], [self.shape(p) for p in operands]
         # TorchLean reductions drop the axis; reshape below restores it for keepdim=True.
         keepdim = bool(kind.get("keepdim"))
         if keepdim:
@@ -237,7 +259,7 @@ class FxEmitter:
     def elementwise_operands(self, n, operands, env: dict) -> list[str]:
         """Broadcast each operand of elementwise `n`, as printed in `env`, to `n`'s shape."""
         target = self.shape(n)
-        return [self.broadcast(env[p], self.shape(p), target) for p in operands]
+        return [self.broadcast(env[p].expr, self.shape(p), target) for p in operands]
 
     def broadcast(self, value: str, shape: list[str], target: list[str]) -> str:
         """Broadcast `value` between equal-rank shapes; each axis of `shape` must match `target` or be `1`."""
@@ -267,15 +289,15 @@ class FxEmitter:
                 outs = n.args[0]
                 if outs is not None and len(outs) > 0:
                     # Several results form a tuple, e.g. the values a loop carries.
-                    result = unparen(env[outs[0]]) if len(outs) == 1 else (
-                        f"({', '.join(unparen(env[out]) for out in outs)})")
+                    result = unparen(env[outs[0]].expr) if len(outs) == 1 else (
+                        f"({', '.join(unparen(env[out].expr) for out in outs)})")
             elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in SYM_OPS:
-                env[n] = self.aten(n, env)
+                env[n] = LoweredValue(self.aten(n, env), Kind.COMPUTED)
                 if len(n.users) > 1:
-                    ctx.lets.append(f"let v_{n.name} := {unparen(env[n])}")
-                    env[n] = f"v_{n.name}"
+                    ctx.lets.append(f"let v_{n.name} := {unparen(env[n].expr)}")
+                    env[n] = LoweredValue(f"v_{n.name}", Kind.COMPUTED)
             elif op_name(n) in SYM_OPS:
-                env[n] = self.sym(n.meta["val"])
+                env[n] = LoweredValue(self.sym(n.meta["val"]), Kind.SIZE)
             else:
                 self.node(n, env, ctx)
         return "\n".join(ctx.lets + [unparen(ctx.state) if result is None else result])
