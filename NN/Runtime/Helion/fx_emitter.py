@@ -197,6 +197,7 @@ class Kind(enum.Enum):
     OUTPUT = enum.auto()  # the output tensor; device code only stores into it
     SIZE = enum.auto()  # a symbolic size
     FUSED = enum.auto()  # printed by its user, e.g. `_mask_to(-inf)` inside its `amax`
+    TUPLE = enum.auto()  # the values a loop carries, one part each
 
 
 @dataclasses.dataclass(frozen=True)
@@ -206,9 +207,12 @@ class LoweredValue:
     Kernel argument: `LoweredValue("x0", Kind.INPUT)`.
     Computed sum: `LoweredValue("(Tensor.addSpec x0 x1)", Kind.COMPUTED)`.
     Output buffer: `LoweredValue(None, Kind.OUTPUT)`.
+    Two carried values: `LoweredValue("acc1", Kind.TUPLE, parts)`, the parts lowered as `acc1.1`
+    and `acc1.2`.
     """
     expr: str | None  # Lean text; None for output buffers and nodes printed by their users
     kind: Kind
+    parts: tuple[LoweredValue, ...] = ()  # a tuple's values, in order; empty for other kinds
 
 
 class FxEmitter:

@@ -483,8 +483,7 @@ class Emitter(fx_emitter.FxEmitter):
             if fx_emitter.op_name(args[0]) != "_for_loop":
                 refuse("only getitem of a loop's result is supported")
             loop, index = args
-            env[ir_node] = LoweredValue(
-                _component(env[loop].expr, index, len(self.carried_arguments[loop])), Kind.COMPUTED)
+            env[ir_node] = env[loop].parts[index]
             result = self._loop_results(loop)[index]
             if result in self.ereal:
                 self.ereal[ir_node] = self.ereal[result]
@@ -578,9 +577,10 @@ class Emitter(fx_emitter.FxEmitter):
         else:
             # A carrying loop, e.g. an accumulator.
             accumulator = f"acc{block_id}"
-            for i, argument in enumerate(carried):
-                arguments[placeholders[argument]] = LoweredValue(
-                    _component(accumulator, i, len(carried)), Kind.COMPUTED)
+            parts = tuple(LoweredValue(_component(accumulator, i, len(carried)), Kind.COMPUTED)
+                          for i in range(len(carried)))
+            for part, argument in zip(parts, carried):
+                arguments[placeholders[argument]] = part
             initial = f"({', '.join(fx_emitter.unparen(env[initial_values[a]].expr) for a in carried)})"
             body = self.emit_graph(
                 loop_graph.graph, {**env, **arguments}, Context(nest=nest)
@@ -604,7 +604,7 @@ class Emitter(fx_emitter.FxEmitter):
                 f"let {accumulator} := forTiles {extent} B{block_id} {initial} "
                 f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)}"
             )
-            env[ir_node] = LoweredValue(accumulator, Kind.COMPUTED)
+            env[ir_node] = LoweredValue(accumulator, Kind.TUPLE, parts)
 
     def emit(self, name: str, source: str) -> str:
         """Emit the complete Lean module for the outer `hl.tile` grid loop and its body."""
