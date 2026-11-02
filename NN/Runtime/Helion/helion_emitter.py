@@ -136,9 +136,16 @@ class Emitter(fx_emitter.FxEmitter):
         self.store_count = 0
         self.in_bounds = []   # loop bound ≤ tensor size, for every load and store; trivial ones omitted
         self.full_slices = []  # axis size ≤ block size, for every full slice (`:`)
-        # IR nodes whose Lean value is an extended-real tensor; each entry is `⊥` or finite, never `⊤`.
-        self.ereal = set()
+        # Extended-real values, each mapped to whether it may be `⊥`. None is ever `⊤`.
+        self.ereal = {}
+        # Loops that must run at least once, as `0 < extent` and `0 < block`.
+        self.nonempty_loops = []
         self.carried_arguments = self._carried_arguments()
+
+    def _loop_results(self, loop) -> list:
+        """Return what a `_for_loop`'s body returns, one value per loop result, e.g. `[new_acc]`."""
+        body_graph = self.device_ir.graphs[loop.args[0]].graph
+        return body_graph.output_node().args[0]
 
     def _carried_arguments(self) -> dict:
         """Map each loop's result indices to the argument indices they update.
@@ -164,8 +171,7 @@ class Emitter(fx_emitter.FxEmitter):
         for info in self.device_ir.graphs:
             for loop in info.graph.nodes:
                 if fx_emitter.op_name(loop) == "_for_loop":
-                    results = self.device_ir.graphs[loop.args[0]].graph.output_node().args[0]
-                    carries[loop] = [None] * len(results)
+                    carries[loop] = [None] * len(self._loop_results(loop))
         # Fill each slot from its phi.
         for info in self.device_ir.graphs:
             for phi in info.graph.nodes:
@@ -395,7 +401,7 @@ class Emitter(fx_emitter.FxEmitter):
         return self.reshape(call, self.shape(ir_node)) if keepdim else call
 
     def _ereal_op(self, ir_node, values: dict) -> str:
-        """Print an op on extended reals: `maximum` stays in `EReal`, `exp` returns to `ℝ`.
+        """Print an op on extended reals: `maximum` and subtraction stay in `EReal`, `exp` returns to `ℝ`.
 
         Python:
             mx = hl.full([tile_m, tile_n], float("-inf"), dtype=x.dtype)
@@ -411,17 +417,26 @@ class Emitter(fx_emitter.FxEmitter):
             expE (Tensor.map2Spec max (Tensor.full [B0, B1] (⊥ : EReal)) (toEReal (loadTile …)))
         """
         op = fx_emitter.op_name(ir_node)
+        # Promote real operands; the result stays extended.
+        promoted = {arg: values[arg] if arg in self.ereal else f"(toEReal {values[arg]})"
+                    for arg in ir_node.args}
         if op == "exp.default":
             return f"(expE {values[ir_node.args[0]]})"
         elif op == "maximum.default":
-            # Promote real operands; the result stays extended.
-            promoted = {arg: values[arg] if arg in self.ereal else f"(toEReal {values[arg]})"
-                        for arg in ir_node.args}
             operands = self.elementwise_operands(ir_node, ir_node.args, promoted)
-            self.ereal.add(ir_node)
+            # The max is `⊥` only where every operand is.
+            self.ereal[ir_node] = all(self.ereal.get(arg, False) for arg in ir_node.args)
             return f"(Tensor.map2Spec max {' '.join(operands)})"
+        elif op == "sub.Tensor":
+            minuend, subtrahend = ir_node.args
+            # A finite value minus `⊥` is `⊤`, which `expE` gets wrong.
+            if self.ereal.get(subtrahend, False):
+                refuse("only subtracting values that cannot be -inf is supported")
+            operands = self.elementwise_operands(ir_node, ir_node.args, promoted)
+            self.ereal[ir_node] = self.ereal.get(minuend, False)
+            return f"(Tensor.map2Spec (· - ·) {' '.join(operands)})"
         else:
-            refuse("extended reals are supported only in maximum and exp")
+            refuse("extended reals are supported only in maximum, subtraction and exp")
 
     def node(self, ir_node, values: dict, context: dict):
         """Translate a Helion-specific IR node into Lean.
@@ -436,7 +451,7 @@ class Emitter(fx_emitter.FxEmitter):
         elif op == "_new_var":
             values[ir_node] = values[args[0]]
             if args[0] in self.ereal:
-                self.ereal.add(ir_node)
+                self.ereal[ir_node] = self.ereal[args[0]]
         elif op == "_host_tensor":
             if args[0] not in self.lean_inputs and args[0] != self.output_name:
                 refuse("only the arguments and the output are supported in device code")
@@ -448,7 +463,7 @@ class Emitter(fx_emitter.FxEmitter):
             elif args[1] == float("-inf"):
                 # ℝ has no -inf: it is the extended real `⊥`.
                 values[ir_node] = f"(Tensor.full [{shape}] (⊥ : EReal))"
-                self.ereal.add(ir_node)
+                self.ereal[ir_node] = True
             else:
                 refuse("only 0 and -inf fills are supported")
         elif op == "subscript":
@@ -457,7 +472,7 @@ class Emitter(fx_emitter.FxEmitter):
                 refuse("only subscripts with `:` and `None` are supported")
             values[ir_node] = self.reshape(values[args[0]], self.shape(ir_node))
             if args[0] in self.ereal:
-                self.ereal.add(ir_node)
+                self.ereal[ir_node] = self.ereal[args[0]]
         elif op == "_for_loop":
             self._emit_inner_loop(ir_node, values, context)
         elif op == "getitem":
@@ -465,15 +480,16 @@ class Emitter(fx_emitter.FxEmitter):
                 refuse("only getitem of a loop's result is supported")
             loop, index = args
             values[ir_node] = _component(values[loop], index, len(self.carried_arguments[loop]))
-            if loop.args[3][self.carried_arguments[loop][index]] in self.ereal:
-                self.ereal.add(ir_node)
+            result = self._loop_results(loop)[index]
+            if result in self.ereal:
+                self.ereal[ir_node] = self.ereal[result]
         elif op == "_phi":
             before, after = args
             if fx_emitter.op_name(after) != "getitem" or fx_emitter.op_name(after.args[0]) != "_for_loop":
                 refuse("only phis after loops are supported")
             values[ir_node] = values[after]
             if after in self.ereal:
-                self.ereal.add(ir_node)
+                self.ereal[ir_node] = self.ereal[after]
         elif op == "_mask_to":
             if args[0] in self.ereal:
                 refuse("only masking real values is supported")
@@ -538,7 +554,7 @@ class Emitter(fx_emitter.FxEmitter):
         # The arguments the loop updates; the others are only read.
         carried = self.carried_arguments[ir_node]
         arguments = {p: values[v] for p, v in zip(placeholders, initial_values)}
-        self.ereal |= {p for p, v in zip(placeholders, initial_values) if v in self.ereal}
+        self.ereal |= {p: self.ereal[v] for p, v in zip(placeholders, initial_values) if v in self.ereal}
         if len(carried) == 0:
             # A storing loop: each iteration writes into the output and only reads its arguments.
             if context["state"] is None:
@@ -560,9 +576,20 @@ class Emitter(fx_emitter.FxEmitter):
                 loop_graph.graph, {**values, **arguments}, {"nest": nest, "state": None, "lets": []}
             )
             # Each carried value must keep its type: real, or extended.
-            results = loop_graph.graph.output_node().args[0]
+            results = self._loop_results(ir_node)
             if any((r in self.ereal) != (initial_values[a] in self.ereal) for r, a in zip(results, carried)):
                 refuse("only carried values that stay real or stay extended are supported")
+            for result, argument in zip(results, carried):
+                start = initial_values[argument]
+                if start not in self.ereal:
+                    continue
+                if self.ereal[result] and not self.ereal[start]:
+                    refuse("only loops that keep a finite carried value finite are supported")
+                # A `⊥` start ends finite only if the loop runs, e.g. a running max from -inf.
+                if self.ereal[start] and not self.ereal[result]:
+                    for fact in (f"0 < {extent}", f"0 < B{block_id}"):
+                        if fact not in self.nonempty_loops:
+                            self.nonempty_loops.append(fact)
             context["lets"].append(
                 f"let {accumulator} := forTiles {extent} B{block_id} {initial} "
                 f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)}"
