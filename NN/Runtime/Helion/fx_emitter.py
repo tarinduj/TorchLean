@@ -21,7 +21,8 @@ def size_name(i: int) -> str:
 # Our direct translation supports tensor division through `Tensor.divSpec`.
 _DIRECT_ONLY_KINDS = {"div.Tensor": {"kind": "div"}}
 # Binary elementwise kinds and their TorchLean ops; operands are broadcast to the output shape.
-_BINARY_ELEMENTWISE_KINDS = {"add": "addSpec", "sub": "subSpec", "mul_elem": "mulSpec", "div": "divSpec"}
+_BINARY_ELEMENTWISE_KINDS = {
+    "add": "addSpec", "sub": "subSpec", "mul_elem": "mulSpec", "div": "divSpec", "max_elem": "maxSpec"}
 
 
 def refuse(msg: str):
