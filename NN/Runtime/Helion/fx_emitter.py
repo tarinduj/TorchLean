@@ -223,6 +223,16 @@ class LoweredValue:
     element: Element = Element.REAL  # what a tensor's entries are
 
 
+@dataclasses.dataclass(frozen=True)
+class LoweredGraph:
+    """A graph's Lean code and the values it returns.
+
+    Loop body updating a running max: `LoweredGraph("let v_mx := …\\nv_mx", (LoweredValue("v_mx", …),))`.
+    """
+    code: str
+    results: tuple[LoweredValue, ...]  # the graph's outputs, in order; empty if it returns nothing
+
+
 class FxEmitter:
     """Walk an FX graph, printing ATen nodes; subclasses handle other node kinds."""
 
@@ -291,18 +301,14 @@ class FxEmitter:
         """Refuse non-ATen nodes unless a subclass supplies their translation."""
         refuse(f"op {op_name(n)} is not supported")
 
-    def emit_graph(self, graph, env: dict, ctx: Context) -> str:
+    def emit_graph(self, graph, env: dict, ctx: Context) -> LoweredGraph:
         """Return Lean code for a graph; `env` holds node values and `ctx` collects lets and output state."""
-        result = None
+        results = ()
         for n in graph.nodes:
             if n.op == "placeholder":
                 continue
             if n.op == "output":
-                outs = n.args[0]
-                if outs is not None and len(outs) > 0:
-                    # Several results form a tuple, e.g. the values a loop carries.
-                    result = unparen(env[outs[0]].expr) if len(outs) == 1 else (
-                        f"({', '.join(unparen(env[out].expr) for out in outs)})")
+                results = tuple(env[out] for out in n.args[0] or ())
             elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in SYM_OPS:
                 env[n] = self.aten(n, env)
                 if len(n.users) > 1:
@@ -312,4 +318,10 @@ class FxEmitter:
                 env[n] = LoweredValue(self.sym(n.meta["val"]), Kind.SIZE)
             else:
                 self.node(n, env, ctx)
-        return "\n".join(ctx.lets + [unparen(ctx.state) if result is None else result])
+        if not results:
+            last = unparen(ctx.state)
+        elif len(results) == 1:
+            last = unparen(results[0].expr)
+        else:
+            last = f"({', '.join(unparen(r.expr) for r in results)})"
+        return LoweredGraph("\n".join(ctx.lets + [last]), results)

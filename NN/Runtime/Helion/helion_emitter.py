@@ -593,7 +593,7 @@ class Emitter(fx_emitter.FxEmitter):
             )
             ctx.state = (
                 f"(forTiles {extent} B{block_id} {ctx.state} fun tile{block_id} out =>\n"
-                f"{_indent(body, 2)})"
+                f"{_indent(body.code, 2)})"
             )
         else:
             # A carrying loop, e.g. an accumulator.
@@ -605,9 +605,8 @@ class Emitter(fx_emitter.FxEmitter):
                 arguments[placeholders[argument]] = LoweredValue(
                     _component(accumulator, i, count), Kind.COMPUTED, element=start)
             initial = f"({', '.join(fx_emitter.unparen(env[initial_values[a]].expr) for a in carried)})"
-            body_env = {**env, **arguments}
-            body = self.emit_graph(loop_graph.graph, body_env, Context(nest=nest))
-            ends = [body_env[result].element for result in self._loop_results(ir_node)]
+            body = self.emit_graph(loop_graph.graph, {**env, **arguments}, Context(nest=nest))
+            ends = [result.element for result in body.results]
             for start, end in zip(starts, ends):
                 if (start is Element.REAL) != (end is Element.REAL):
                     refuse("only carried values that stay real or stay extended are supported")
@@ -619,7 +618,7 @@ class Emitter(fx_emitter.FxEmitter):
                     self.nonempty_loops.add(f"0 < B{block_id}")
             ctx.lets.append(
                 f"let {accumulator} := forTiles {extent} B{block_id} {initial} "
-                f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)}"
+                f"fun tile{block_id} {accumulator} =>\n{_indent(body.code, 2)}"
             )
             # After the loop, each carried value has the entries its body produces.
             parts = tuple(LoweredValue(_component(accumulator, i, count), Kind.COMPUTED, element=end)
@@ -687,6 +686,6 @@ class Emitter(fx_emitter.FxEmitter):
             f"{docstring}\n"
             f"{signature}\n"
             f"{grid_loops}"
-            f"{fx_emitter.wrap_lines(_indent(body, 2 * len(self.grid_blocks) + 2))}\n\n"
+            f"{fx_emitter.wrap_lines(_indent(body.code, 2 * len(self.grid_blocks) + 2))}\n\n"
             f"end {name}\n"
         )
