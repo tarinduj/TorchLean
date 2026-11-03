@@ -42,96 +42,6 @@ def op_name(node) -> str:
     return getattr(node.target, "__name__", str(node.target))
 
 
-def unparen(e: str) -> str:
-    return e[1:-1] if e.startswith("(") and e.endswith(")") else e
-
-
-def _split_top(expr: str) -> list[str]:
-    """Split `expr` at spaces outside brackets."""
-    parts, cur, depth = [], "", 0
-    for ch in expr:
-        depth += ch in "([{⟨"
-        depth -= ch in ")]}⟩"
-        if ch == " " and depth == 0:
-            parts.append(cur)
-            cur = ""
-        else:
-            cur += ch
-    return [p for p in parts + [cur] if p]
-
-
-def _outer_parens(expr: str) -> bool:
-    """Return whether `expr` is one parenthesized term."""
-    if not (expr.startswith("(") and expr.endswith(")")):
-        return False
-    depth = 0
-    for k, ch in enumerate(expr):
-        depth += ch in "([{⟨"
-        depth -= ch in ")]}⟩"
-        if depth == 0 and k < len(expr) - 1:
-            return False
-    return True
-
-
-def _tuple_components(expr: str) -> list[str]:
-    """Split printed tuple text into its values, e.g. `"(a, b, c)"` → `["a", "b", "c"]`."""
-    if not _outer_parens(expr):
-        return [expr]
-    parts, cur, depth = [], "", 0
-    for ch in expr[1:-1]:
-        depth += ch in "([{⟨"
-        depth -= ch in ")]}⟩"
-        if ch == "," and depth == 0:
-            parts.append(cur.strip())
-            cur = ""
-        else:
-            cur += ch
-    return parts + [cur.strip()]
-
-
-def wrap_expr(expr: str, indent: int) -> list[str]:
-    """Lay out an application in lines of at most WIDTH, putting arguments that do not fit below."""
-    pad = " " * indent
-    if indent + len(expr) <= WIDTH:
-        return [pad + expr]
-    components = _tuple_components(expr)
-    if len(components) > 1:
-        # A tuple: each component starts a line.
-        lines = []
-        for component in components:
-            lines += wrap_expr(component, indent + 1)
-            lines[-1] += ","
-        lines[0] = pad + "(" + lines[0].lstrip()
-        lines[-1] = lines[-1][:-1] + ")"
-        return lines
-    if _outer_parens(expr):
-        lines = wrap_expr(expr[1:-1], indent + 1)
-        lines = [pad + "(" + lines[0].lstrip()] + [ln[1:] for ln in lines[1:]]
-        lines[-1] += ")"
-        return lines
-    head, *args = _split_top(expr)
-    first = head
-    while args and indent + len(first) + 1 + len(args[0]) <= WIDTH:
-        first += " " + args.pop(0)
-    return [pad + first] + [ln for a in args for ln in wrap_expr(a, indent + 2)]
-
-
-def wrap_lines(text: str) -> str:
-    """Wrap each over-long application line of `text`, and the value of an over-long `let`; leave
-    other binding lines unchanged."""
-    out = []
-    for ln in text.splitlines():
-        body = ln.lstrip()
-        indent = len(ln) - len(body)
-        head, sep, value = body.partition(" := ")
-        if len(ln) > WIDTH and body.startswith("let ") and sep and " " not in head[4:]:
-            out += [" " * indent + head + " :="] + wrap_expr(unparen(value), indent + 2)
-            continue
-        binding = any(t in ("let", "fun", ":=", "=>") for t in _split_top(body))
-        out += [ln] if len(ln) <= WIDTH or binding else wrap_expr(body, indent)
-    return "\n".join(out)
-
-
 def print_def(head: str, binders: list[str], result: str) -> str:
     """Lay out `head binders : result :=`, continuing long signatures on lines indented four."""
     lines, cur = [], head
@@ -188,11 +98,19 @@ class Term(abc.ABC):
 
     @abc.abstractmethod
     def show(self) -> str:
-        """Print the term."""
+        """Print the term on one line, apart from function bodies."""
 
     def show_as_argument(self) -> str:
         """Print the term as a function argument, in parentheses where it needs them."""
         return self.show()
+
+    def layout(self, indent: int) -> list[str]:
+        """Lay out the term from column `indent` in lines of at most WIDTH where it can."""
+        return [" " * indent + self.show()]
+
+    def layout_as_argument(self, indent: int) -> list[str]:
+        """Lay out the term as a function argument from column `indent`."""
+        return self.layout(indent)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -216,6 +134,30 @@ class App(Term):
     def show_as_argument(self) -> str:
         return f"({self.show()})"
 
+    def layout(self, indent: int) -> list[str]:
+        """Keep the head and the arguments that fit on the first line; put each other argument below,
+        two deeper. A trailing `fun` stays on the first line, its body below."""
+        pad = " " * indent
+        if self.args and isinstance(self.args[-1], Fun):
+            *args, fun = self.args
+            first = " ".join([self.head, *(arg.show_as_argument() for arg in args), fun.header()])
+            return [pad + first] + fun.body.layout(indent + 2)
+        if indent + len(self.show()) <= WIDTH:
+            return [pad + self.show()]
+        first, rest = self.head, list(self.args)
+        while rest and indent + len(first) + 1 + len(rest[0].show_as_argument()) <= WIDTH:
+            first += " " + rest.pop(0).show_as_argument()
+        return [pad + first] + [line for arg in rest for line in arg.layout_as_argument(indent + 2)]
+
+    def layout_as_argument(self, indent: int) -> list[str]:
+        if indent + len(self.show_as_argument()) <= WIDTH:
+            return [" " * indent + self.show_as_argument()]
+        # Lay out inside the parentheses, then open them where the term starts.
+        lines = self.layout(indent + 1)
+        lines = [" " * indent + "(" + lines[0].lstrip()] + [line[1:] for line in lines[1:]]
+        lines[-1] += ")"
+        return lines
+
 
 @dataclasses.dataclass(frozen=True)
 class Tup(Term):
@@ -224,6 +166,18 @@ class Tup(Term):
 
     def show(self) -> str:
         return f"({', '.join(item.show() for item in self.items)})"
+
+    def layout(self, indent: int) -> list[str]:
+        """Start each item on its own line when the tuple does not fit on one."""
+        if indent + len(self.show()) <= WIDTH:
+            return [" " * indent + self.show()]
+        lines = []
+        for item in self.items:
+            lines += item.layout(indent + 1)
+            lines[-1] += ","
+        lines[0] = " " * indent + "(" + lines[0].lstrip()
+        lines[-1] = lines[-1][:-1] + ")"
+        return lines
 
 
 @dataclasses.dataclass(frozen=True)
@@ -236,6 +190,19 @@ class Let(Term):
     def show(self) -> str:
         return f"let {self.name} := {self.value.show()}\n{self.body.show()}"
 
+    def layout(self, indent: int) -> list[str]:
+        """Put the value after `:=` when it fits or ends in a `fun`; otherwise below, two deeper."""
+        pad, head = " " * indent, f"let {self.name} :="
+        if "\n" in self.value.show():
+            # A value with a function body, e.g. a loop: its first line follows `:=`.
+            value = self.value.layout(indent)
+            binding = [pad + head + " " + value[0].lstrip()] + value[1:]
+        elif indent + len(head) + 1 + len(self.value.show()) <= WIDTH:
+            binding = [pad + head + " " + self.value.show()]
+        else:
+            binding = [pad + head] + self.value.layout(indent + 2)
+        return binding + self.body.layout(indent)
+
 
 @dataclasses.dataclass(frozen=True)
 class Fun(Term):
@@ -243,9 +210,15 @@ class Fun(Term):
     params: tuple[str, ...]
     body: Term
 
+    def header(self) -> str:
+        return f"fun {' '.join(self.params)} =>"
+
     def show(self) -> str:
         body = "\n".join("  " + line for line in self.body.show().splitlines())
-        return f"fun {' '.join(self.params)} =>\n{body}"
+        return f"{self.header()}\n{body}"
+
+    def layout(self, indent: int) -> list[str]:
+        return [" " * indent + self.header()] + self.body.layout(indent + 2)
 
 
 @dataclasses.dataclass

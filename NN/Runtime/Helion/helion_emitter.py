@@ -37,10 +37,6 @@ class Predicate:
             self.facts.append(fact)
 
 
-def _indent(text: str, spaces: int) -> str:
-    return "\n".join(" " * spaces + line for line in text.splitlines())
-
-
 def _component(name: str, i: int, count: int) -> str:
     """Print how to read result `i` from a loop's final value.
 
@@ -677,6 +673,7 @@ class Emitter(fx_emitter.FxEmitter):
             docstring = _doc_comment(
                 f"Run the Helion kernel on {inputs}, writing into the output buffer `out0`.{scope}"
             )
+        lines = body.code.layout(2 * len(self.grid_blocks) + 2)
         return (
             f"-- Generated from {source} by NN/Runtime/Helion/helion_emitter.py; do not edit.\n"
             "import NN.Runtime.Helion.Tile\n\n"
@@ -685,6 +682,6 @@ class Emitter(fx_emitter.FxEmitter):
             f"{docstring}\n"
             f"{signature}\n"
             f"{grid_loops}"
-            f"{fx_emitter.wrap_lines(_indent(body.code.show(), 2 * len(self.grid_blocks) + 2))}\n\n"
+            + "\n".join(lines) + "\n\n"
             f"end {name}\n"
         )
