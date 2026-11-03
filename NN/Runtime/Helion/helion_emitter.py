@@ -114,6 +114,8 @@ def _assigned_names(statement) -> list[str] | None:
 class Emitter(fx_emitter.FxEmitter):
     """Check a captured Helion kernel and print its device IR as a Lean definition."""
 
+    size_ops = (*fx_emitter.FxEmitter.size_ops, "_get_symnode")
+
     def __init__(self, kernel, example_args: tuple, bridge):
         """Capture device IR and validate the inputs and host-code pattern.
 
@@ -477,9 +479,7 @@ class Emitter(fx_emitter.FxEmitter):
         """
         args = ir_node.args
         op = fx_emitter.op_name(ir_node)
-        if op == "_get_symnode":
-            return LoweredValue(self.sym(ir_node.meta["val"]), Kind.SIZE)
-        elif op == "_new_var":
+        if op == "_new_var":
             return env[args[0]]
         elif op == "_host_tensor":
             if args[0] not in self.lean_inputs and args[0] != self.output_name:

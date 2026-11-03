@@ -6,7 +6,6 @@ import enum
 
 import torch
 
-SYM_OPS = ("sym_size.int", "sym_size")
 WIDTH = 100
 
 
@@ -236,6 +235,8 @@ class LoweredGraph:
 class FxEmitter:
     """Walk an FX graph, printing ATen nodes; subclasses handle other node kinds."""
 
+    size_ops = ("sym_size.int", "sym_size")  # ops whose value is a symbolic size
+
     def __init__(self, bridge, names: dict):
         self.bridge, self.names, self.hyps = bridge, names, set()
         # _lower_kind uses this map when interpreting symbolic dimensions.
@@ -309,12 +310,12 @@ class FxEmitter:
                 continue
             if n.op == "output":
                 results = tuple(env[out] for out in n.args[0] or ())
-            elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in SYM_OPS:
+            elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in self.size_ops:
                 env[n] = self.aten(n, env)
                 if len(n.users) > 1:
                     ctx.lets.append(f"let v_{n.name} := {unparen(env[n].expr)}")
                     env[n] = dataclasses.replace(env[n], expr=f"v_{n.name}")
-            elif op_name(n) in SYM_OPS:
+            elif op_name(n) in self.size_ops:
                 env[n] = LoweredValue(self.sym(n.meta["val"]), Kind.SIZE)
             else:
                 value = self.node(n, env, ctx)
