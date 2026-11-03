@@ -65,6 +65,8 @@ def print_op(kind: dict, args: list[Term], shapes: list[list[str]]) -> tuple[App
         if len(args) != 2:
             refuse(f"{kind['kind']} with a scalar operand is not supported")
         return App(f"Tensor.{_BINARY_ELEMENTWISE_KINDS[kind['kind']]}", (args[0], args[1])), set()
+    if kind == {"kind": "matmul"} and len(shapes) == 2 and len(shapes[0]) == len(shapes[1]) == 2:
+        return App("matMulSpec", (args[0], args[1])), set()
     if kind == {"kind": "relu"}:
         return App("Activation.reluSpec", (args[0],)), set()
     if kind == {"kind": "exp"}:
