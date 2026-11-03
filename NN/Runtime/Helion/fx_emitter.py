@@ -226,16 +226,38 @@ class Tup(Term):
         return f"({', '.join(item.show() for item in self.items)})"
 
 
+@dataclasses.dataclass(frozen=True)
+class Let(Term):
+    """A binding and the term that uses it: `let v_mx := …` above `v_mx`."""
+    name: str
+    value: Term
+    body: Term
+
+    def show(self) -> str:
+        return f"let {self.name} := {self.value.show()}\n{self.body.show()}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Fun(Term):
+    """A function whose body starts on the next line, two deeper: `fun tile1 acc1 =>` above the body."""
+    params: tuple[str, ...]
+    body: Term
+
+    def show(self) -> str:
+        body = "\n".join("  " + line for line in self.body.show().splitlines())
+        return f"fun {' '.join(self.params)} =>\n{body}"
+
+
 @dataclasses.dataclass
 class Context:
     """Track the enclosing loops, current output, and generated let lines for one graph body.
 
-    Grid body: `Context(nest=[0], state="out", lets=[])`.
+    Grid body: `Context(nest=[0], state=Atom("out"), lets=[])`.
     Inner loop updating an accumulator: `Context(nest=[0, 1], state=None, lets=[])`.
     """
     nest: list[int] = dataclasses.field(default_factory=list)  # block ids of the enclosing tile loops
-    state: str | None = None  # the output as stored so far, in a body that stores
-    lets: list[str] = dataclasses.field(default_factory=list)  # bindings before the body's result
+    state: Term | None = None  # the output as stored so far, in a body that stores
+    lets: list[tuple[str, Term]] = dataclasses.field(default_factory=list)  # bindings before the body's result
 
 
 class Kind(enum.Enum):
@@ -275,9 +297,9 @@ class LoweredValue:
 class LoweredGraph:
     """A graph's Lean code and the values it returns.
 
-    Loop body updating a running max: `LoweredGraph("let v_mx := …\\nv_mx", (LoweredValue(Atom("v_mx"), …),))`.
+    Loop body updating a running max: `LoweredGraph(Let("v_mx", …, Atom("v_mx")), (LoweredValue(Atom("v_mx"), …),))`.
     """
-    code: str
+    code: Term
     results: tuple[LoweredValue, ...]  # the graph's outputs, in order; empty if it returns nothing
 
 
@@ -364,7 +386,7 @@ class FxEmitter:
             elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in self.size_ops:
                 env[n] = self.aten(n, env)
                 if len(n.users) > 1:
-                    ctx.lets.append(f"let v_{n.name} := {env[n].expr.show()}")
+                    ctx.lets.append((f"v_{n.name}", env[n].expr))
                     env[n] = dataclasses.replace(env[n], expr=Atom(f"v_{n.name}"))
             elif op_name(n) in self.size_ops:
                 env[n] = LoweredValue(Atom(self.sym(n.meta["val"])), Kind.SIZE)
@@ -373,9 +395,11 @@ class FxEmitter:
                 if value is not None:
                     env[n] = value
         if not results:
-            last = unparen(ctx.state)
+            code = ctx.state
         elif len(results) == 1:
-            last = results[0].expr.show()
+            code = results[0].expr
         else:
-            last = Tup(tuple(r.expr for r in results)).show()
-        return LoweredGraph("\n".join(ctx.lets + [last]), results)
+            code = Tup(tuple(r.expr for r in results))
+        for name, value in reversed(ctx.lets):
+            code = Let(name, value, code)
+        return LoweredGraph(code, results)

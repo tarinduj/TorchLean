@@ -12,7 +12,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))  # the sibling module `fx_emitter`
 import fx_emitter  # noqa: E402
-from fx_emitter import App, Atom, Context, Element, Kind, LoweredValue, Tup  # noqa: E402
+from fx_emitter import App, Atom, Context, Element, Fun, Kind, LoweredValue, Tup  # noqa: E402
 
 refuse, invalid = fx_emitter.refuse, fx_emitter.invalid
 
@@ -563,10 +563,7 @@ class Emitter(fx_emitter.FxEmitter):
             self.output_shape = self.shape(destination)
             self._record_in_bounds(bounds, self.output_shape)
             self.store_count += 1
-            ctx.state = (
-                App("storeTile",
-                    (*_tile_args(blocks, bounds), Atom(ctx.state), _tiles(tiles), env[value].expr)).show_as_argument()
-            )
+            ctx.state = App("storeTile", (*_tile_args(blocks, bounds), ctx.state, _tiles(tiles), env[value].expr))
         else:
             refuse(f"device op {op} is not supported")
 
@@ -595,12 +592,10 @@ class Emitter(fx_emitter.FxEmitter):
             if ctx.state is None:
                 refuse("only storing loops outside loops that carry a value are supported")
             body = self.emit_graph(
-                loop_graph.graph, {**env, **arguments}, Context(nest=nest, state="out")
+                loop_graph.graph, {**env, **arguments}, Context(nest=nest, state=Atom("out"))
             )
-            ctx.state = (
-                f"(forTiles {extent} B{block_id} {ctx.state} fun tile{block_id} out =>\n"
-                f"{_indent(body.code, 2)})"
-            )
+            ctx.state = App("forTiles", (Atom(extent), Atom(f"B{block_id}"), ctx.state,
+                                         Fun((f"tile{block_id}", "out"), body.code)))
         else:
             # A carrying loop, e.g. an accumulator.
             accumulator = f"acc{block_id}"
@@ -610,7 +605,7 @@ class Emitter(fx_emitter.FxEmitter):
             for i, (argument, start) in enumerate(zip(carried, starts)):
                 arguments[placeholders[argument]] = LoweredValue(
                     Atom(_component(accumulator, i, count)), Kind.COMPUTED, element=start)
-            initial = Tup(tuple(env[initial_values[a]].expr for a in carried)).show()
+            initial = Tup(tuple(env[initial_values[a]].expr for a in carried))
             body = self.emit_graph(loop_graph.graph, {**env, **arguments}, Context(nest=nest))
             ends = [result.element for result in body.results]
             for start, end in zip(starts, ends):
@@ -622,10 +617,8 @@ class Emitter(fx_emitter.FxEmitter):
                 if start is Element.EREAL_MAY_BE_BOTTOM and end is Element.EREAL_FINITE:
                     self.nonempty_loops.add(f"0 < {extent}")
                     self.nonempty_loops.add(f"0 < B{block_id}")
-            ctx.lets.append(
-                f"let {accumulator} := forTiles {extent} B{block_id} {initial} "
-                f"fun tile{block_id} {accumulator} =>\n{_indent(body.code, 2)}"
-            )
+            ctx.lets.append((accumulator, App("forTiles", (Atom(extent), Atom(f"B{block_id}"), initial,
+                                                           Fun((f"tile{block_id}", accumulator), body.code)))))
             # After the loop, each carried value has the entries its body produces.
             parts = tuple(LoweredValue(Atom(_component(accumulator, i, count)), Kind.COMPUTED, element=end)
                           for i, end in enumerate(ends))
@@ -639,7 +632,7 @@ class Emitter(fx_emitter.FxEmitter):
         if len(self.device_ir.root_ids) != 1:
             refuse("only one root graph is supported")
         root = self.device_ir.graphs[self.device_ir.root_ids[0]].graph
-        body = self.emit_graph(root, {}, Context(nest=list(self.grid_blocks), state="out"))
+        body = self.emit_graph(root, {}, Context(nest=list(self.grid_blocks), state=Atom("out")))
         # Only the root graph, where each full slice is one block, is translated. Helion runs it
         # for configs whose `reduction_loops` entries are `None`; other configs run the
         # reduction-loop graphs, which split full slices into chunks.
@@ -692,6 +685,6 @@ class Emitter(fx_emitter.FxEmitter):
             f"{docstring}\n"
             f"{signature}\n"
             f"{grid_loops}"
-            f"{fx_emitter.wrap_lines(_indent(body.code, 2 * len(self.grid_blocks) + 2))}\n\n"
+            f"{fx_emitter.wrap_lines(_indent(body.code.show(), 2 * len(self.grid_blocks) + 2))}\n\n"
             f"end {name}\n"
         )
