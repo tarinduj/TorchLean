@@ -469,8 +469,8 @@ class Emitter(fx_emitter.FxEmitter):
         else:
             refuse("extended reals are supported only in maximum, subtraction and exp")
 
-    def node(self, ir_node, env: dict, ctx: Context):
-        """Translate a Helion-specific IR node into Lean.
+    def node(self, ir_node, env: dict, ctx: Context) -> LoweredValue | None:
+        """Translate a Helion-specific IR node into Lean; return its value, or None for a store.
 
         Tile loops, carried values, loads, and stores are handled here. ATen
         tensor operations go through the shared FX walker and op printer.
@@ -478,23 +478,23 @@ class Emitter(fx_emitter.FxEmitter):
         args = ir_node.args
         op = fx_emitter.op_name(ir_node)
         if op == "_get_symnode":
-            env[ir_node] = LoweredValue(self.sym(ir_node.meta["val"]), Kind.SIZE)
+            return LoweredValue(self.sym(ir_node.meta["val"]), Kind.SIZE)
         elif op == "_new_var":
-            env[ir_node] = env[args[0]]
+            return env[args[0]]
         elif op == "_host_tensor":
             if args[0] not in self.lean_inputs and args[0] != self.output_name:
                 refuse("only the arguments and the output are supported in device code")
             if args[0] in self.lean_inputs:
-                env[ir_node] = LoweredValue(self.lean_inputs[args[0]], Kind.INPUT)
+                return LoweredValue(self.lean_inputs[args[0]], Kind.INPUT)
             else:
-                env[ir_node] = LoweredValue(None, Kind.OUTPUT)
+                return LoweredValue(None, Kind.OUTPUT)
         elif op == "full":
             shape = ", ".join(self.shape(ir_node))
             if args[1] == 0:
-                env[ir_node] = LoweredValue(f"(Tensor.zeros [{shape}])", Kind.COMPUTED)
+                return LoweredValue(f"(Tensor.zeros [{shape}])", Kind.COMPUTED)
             elif args[1] == float("-inf"):
                 # ℝ has no -inf: it is the extended real `⊥`.
-                env[ir_node] = LoweredValue(f"(Tensor.full [{shape}] (⊥ : EReal))", Kind.COMPUTED,
+                return LoweredValue(f"(Tensor.full [{shape}] (⊥ : EReal))", Kind.COMPUTED,
                                             element=Element.EREAL_MAY_BE_BOTTOM)
             else:
                 refuse("only 0 and -inf fills are supported")
@@ -503,19 +503,19 @@ class Emitter(fx_emitter.FxEmitter):
             if not all(index == slice(None) or index is None for index in args[1]):
                 refuse("only subscripts with `:` and `None` are supported")
             reshaped = self.reshape(env[args[0]].expr, self.shape(ir_node))
-            env[ir_node] = dataclasses.replace(env[args[0]], expr=reshaped)  # same entries, new shape
+            return dataclasses.replace(env[args[0]], expr=reshaped)  # same entries, new shape
         elif op == "_for_loop":
-            self._emit_inner_loop(ir_node, env, ctx)
+            return self._emit_inner_loop(ir_node, env, ctx)
         elif op == "getitem":
             if fx_emitter.op_name(args[0]) != "_for_loop":
                 refuse("only getitem of a loop's result is supported")
             loop, index = args
-            env[ir_node] = env[loop].parts[index]
+            return env[loop].parts[index]
         elif op == "_phi":
             before, after = args
             if fx_emitter.op_name(after) != "getitem" or fx_emitter.op_name(after.args[0]) != "_for_loop":
                 refuse("only phis after loops are supported")
-            env[ir_node] = env[after]
+            return env[after]
         elif op == "_mask_to":
             if env[args[0]].element is not Element.REAL:
                 refuse("only masking real values is supported")
@@ -523,10 +523,10 @@ class Emitter(fx_emitter.FxEmitter):
                 users = list(ir_node.users)
                 if len(users) != 1 or fx_emitter.op_name(users[0]) != "amax.default":
                     refuse("_mask_to(-inf) is supported only as the input of amax")
-                env[ir_node] = LoweredValue(None, Kind.FUSED)   # printed by its amax
+                return LoweredValue(None, Kind.FUSED)   # printed by its amax
             elif args[1] == 0:
                 blocks, bounds, tiles = self._tile_layout(ir_node)
-                env[ir_node] = LoweredValue(
+                return LoweredValue(
                     f"(maskTo {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] 0 {env[args[0]].expr})",
                     Kind.COMPUTED)
             else:
@@ -539,7 +539,7 @@ class Emitter(fx_emitter.FxEmitter):
                 refuse("only loads without an extra mask are supported")
             blocks, bounds, tiles = self._indexed_tile_layout(ir_node, indices, ctx)
             self._record_in_bounds(bounds, self.shape(source))
-            env[ir_node] = LoweredValue(
+            return LoweredValue(
                 f"(loadTile {_tile_args(blocks, bounds)} 0 {env[source].expr} ![{', '.join(tiles)}])",
                 Kind.COMPUTED)
         elif op == "store":
@@ -564,8 +564,8 @@ class Emitter(fx_emitter.FxEmitter):
         else:
             refuse(f"device op {op} is not supported")
 
-    def _emit_inner_loop(self, ir_node, env: dict, ctx: Context):
-        """Emit an inner `hl.tile` loop as `forTiles`."""
+    def _emit_inner_loop(self, ir_node, env: dict, ctx: Context) -> LoweredValue | None:
+        """Emit an inner `hl.tile` loop as `forTiles`; return a carrying loop's tuple, or None for a storing loop."""
         graph_id, begin, end, initial_values = ir_node.args[:4]
         loop_graph = self.device_ir.graphs[graph_id]
         if len(loop_graph.block_ids) != 1 or len(end) != 1:
@@ -623,7 +623,7 @@ class Emitter(fx_emitter.FxEmitter):
             # After the loop, each carried value has the entries its body produces.
             parts = tuple(LoweredValue(_component(accumulator, i, count), Kind.COMPUTED, element=end)
                           for i, end in enumerate(ends))
-            env[ir_node] = LoweredValue(accumulator, Kind.TUPLE, parts)
+            return LoweredValue(accumulator, Kind.TUPLE, parts)
 
     def emit(self, name: str, source: str) -> str:
         """Emit the complete Lean module for the outer `hl.tile` grid loop and its body."""

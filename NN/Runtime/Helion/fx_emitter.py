@@ -297,7 +297,7 @@ class FxEmitter:
         """Reshape `value` to `target`, e.g. a reduction's result to its `keepdim` shape."""
         return f"(Tensor.reshapeSpec (target := [{', '.join(target)}]) {value} (by simp [Shape.size]))"
 
-    def node(self, n, env: dict, ctx: Context):
+    def node(self, n, env: dict, ctx: Context) -> LoweredValue | None:
         """Refuse non-ATen nodes unless a subclass supplies their translation."""
         refuse(f"op {op_name(n)} is not supported")
 
@@ -317,7 +317,9 @@ class FxEmitter:
             elif op_name(n) in SYM_OPS:
                 env[n] = LoweredValue(self.sym(n.meta["val"]), Kind.SIZE)
             else:
-                self.node(n, env, ctx)
+                value = self.node(n, env, ctx)
+                if value is not None:
+                    env[n] = value
         if not results:
             last = unparen(ctx.state)
         elif len(results) == 1:
