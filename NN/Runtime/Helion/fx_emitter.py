@@ -1,6 +1,7 @@
 """Translate supported FX graphs into Lean calls over TorchLean tensors."""
 from __future__ import annotations
 
+import abc
 import dataclasses
 import enum
 
@@ -143,22 +144,27 @@ def print_def(head: str, binders: list[str], result: str) -> str:
     return "\n".join(lines + [cur])
 
 
-def print_op(kind: dict, args: list[str], shapes: list[list[str]]) -> tuple[str, set[str]]:
+def _nonempty_axis(size: str) -> Atom:
+    """Prove a reduced axis is nonempty from its size's positivity hypothesis."""
+    return Atom(f"(.succ (Shape.hasNonemptyAxisZeroOfPos h{size}).proof)")
+
+
+def print_op(kind: dict, args: list[Term], shapes: list[list[str]]) -> tuple[App, set[str]]:
     """Print one normalized op and return the dimensions it requires to be positive."""
     if kind["kind"] in _BINARY_ELEMENTWISE_KINDS and len(kind) == 1:
         if len(args) != 2:
             refuse(f"{kind['kind']} with a scalar operand is not supported")
-        return f"(Tensor.{_BINARY_ELEMENTWISE_KINDS[kind['kind']]} {args[0]} {args[1]})", set()
+        return App(f"Tensor.{_BINARY_ELEMENTWISE_KINDS[kind['kind']]}", (args[0], args[1])), set()
     if kind == {"kind": "relu"}:
-        return f"(Activation.reluSpec {args[0]})", set()
+        return App("Activation.reluSpec", (args[0],)), set()
     if kind == {"kind": "exp"}:
-        return f"(Tensor.expSpec {args[0]})", set()
+        return App("Tensor.expSpec", (args[0],)), set()
     if kind == {"kind": "softmax", "axis": 1} and len(shapes[0]) == 2:
-        return f"(Activation.softmaxSpec 1 {args[0]})", set()
+        return App("Activation.softmaxSpec", (Atom("1"), args[0])), set()
     if kind == {"kind": "reduce_sum", "axes": [1], "keepdim": False} and len(shapes[0]) == 2:
-        return f"(Tensor.reduceSum 1 {args[0]} (.succ (Shape.hasNonemptyAxisZeroOfPos h{shapes[0][1]}).proof))", {shapes[0][1]}
+        return App("Tensor.reduceSum", (Atom("1"), args[0], _nonempty_axis(shapes[0][1]))), {shapes[0][1]}
     if kind == {"kind": "reduce_max", "axes": [1], "keepdim": False} and len(shapes[0]) == 2:
-        return f"(Tensor.reduceMax 1 {args[0]} (.succ (Shape.hasNonemptyAxisZeroOfPos h{shapes[0][1]}).proof))", {shapes[0][1]}
+        return App("Tensor.reduceMax", (Atom("1"), args[0], _nonempty_axis(shapes[0][1]))), {shapes[0][1]}
     refuse(f"op {kind} is not supported")
 
 
@@ -175,6 +181,49 @@ def amax_kind(n) -> dict:
     if not -rank <= dims[0] < rank:
         invalid(f"expected an amax axis in [-{rank}, {rank})")
     return {"kind": "reduce_max", "axes": [dims[0] % rank], "keepdim": bool(keepdim)}
+
+
+class Term(abc.ABC):
+    """A Lean term."""
+
+    @abc.abstractmethod
+    def show(self) -> str:
+        """Print the term."""
+
+    def show_as_argument(self) -> str:
+        """Print the term as a function argument, in parentheses where it needs them."""
+        return self.show()
+
+
+@dataclasses.dataclass(frozen=True)
+class Atom(Term):
+    """Lean text printed as is: a name, a numeral, or a bracketed leaf, e.g. `x0`, `![tile0]`, `(⊥ : EReal)`."""
+    text: str
+
+    def show(self) -> str:
+        return self.text
+
+
+@dataclasses.dataclass(frozen=True)
+class App(Term):
+    """A function applied to terms: `App("Tensor.expSpec", (Atom("x0"),))` prints `Tensor.expSpec x0`."""
+    head: str
+    args: tuple[Term, ...]
+
+    def show(self) -> str:
+        return " ".join([self.head, *(arg.show_as_argument() for arg in self.args)])
+
+    def show_as_argument(self) -> str:
+        return f"({self.show()})"
+
+
+@dataclasses.dataclass(frozen=True)
+class Tup(Term):
+    """A tuple of terms, e.g. the values a loop carries: `(acc1.1, v_mx)`."""
+    items: tuple[Term, ...]
+
+    def show(self) -> str:
+        return f"({', '.join(item.show() for item in self.items)})"
 
 
 @dataclasses.dataclass
@@ -210,13 +259,13 @@ class Element(enum.Enum):
 class LoweredValue:
     """A graph node's Lean expression and what it represents.
 
-    Kernel argument: `LoweredValue("x0", Kind.INPUT)`.
-    Computed sum: `LoweredValue("(Tensor.addSpec x0 x1)", Kind.COMPUTED)`.
+    Kernel argument: `LoweredValue(Atom("x0"), Kind.INPUT)`.
+    Computed sum: `LoweredValue(App("Tensor.addSpec", (Atom("x0"), Atom("x1"))), Kind.COMPUTED)`.
     Output buffer: `LoweredValue(None, Kind.OUTPUT)`.
-    Two carried values: `LoweredValue("acc1", Kind.TUPLE, parts)`, the parts lowered as `acc1.1`
+    Two carried values: `LoweredValue(Atom("acc1"), Kind.TUPLE, parts)`, the parts lowered as `acc1.1`
     and `acc1.2`.
     """
-    expr: str | None  # Lean text; None for output buffers and nodes printed by their users
+    expr: Term | None  # None for output buffers and nodes printed by their users
     kind: Kind
     parts: tuple[LoweredValue, ...] = ()  # a tuple's values, in order; empty for other kinds
     element: Element = Element.REAL  # what a tensor's entries are
@@ -226,7 +275,7 @@ class LoweredValue:
 class LoweredGraph:
     """A graph's Lean code and the values it returns.
 
-    Loop body updating a running max: `LoweredGraph("let v_mx := …\\nv_mx", (LoweredValue("v_mx", …),))`.
+    Loop body updating a running max: `LoweredGraph("let v_mx := …\\nv_mx", (LoweredValue(Atom("v_mx"), …),))`.
     """
     code: str
     results: tuple[LoweredValue, ...]  # the graph's outputs, in order; empty if it returns nothing
@@ -279,12 +328,12 @@ class FxEmitter:
         self.hyps |= positive
         return LoweredValue(self.reshape(call, self.shape(n)) if keepdim else call, Kind.COMPUTED)
 
-    def elementwise_operands(self, n, operands, env: dict) -> list[str]:
+    def elementwise_operands(self, n, operands, env: dict) -> list[Term]:
         """Broadcast each operand of elementwise `n`, as printed in `env`, to `n`'s shape."""
         target = self.shape(n)
         return [self.broadcast(env[p].expr, self.shape(p), target) for p in operands]
 
-    def broadcast(self, value: str, shape: list[str], target: list[str]) -> str:
+    def broadcast(self, value: Term, shape: list[str], target: list[str]) -> Term:
         """Broadcast `value` between equal-rank shapes; each axis of `shape` must match `target` or be `1`."""
         if shape == target:
             return value
@@ -292,11 +341,13 @@ class FxEmitter:
             refuse(f"broadcasting {shape} to {target} is not supported")
         if any(s not in (t, "1") for s, t in zip(shape, target)):
             invalid(f"cannot broadcast {shape} to {target}")
-        return f"(Tensor.broadcastTo (s₂ := [{', '.join(target)}]) (by simp [Shape.CanBroadcastTo]) {value})"
+        return App("Tensor.broadcastTo",
+                   (Atom(f"(s₂ := [{', '.join(target)}])"), Atom("(by simp [Shape.CanBroadcastTo])"), value))
 
-    def reshape(self, value: str, target: list[str]) -> str:
+    def reshape(self, value: Term, target: list[str]) -> App:
         """Reshape `value` to `target`, e.g. a reduction's result to its `keepdim` shape."""
-        return f"(Tensor.reshapeSpec (target := [{', '.join(target)}]) {value} (by simp [Shape.size]))"
+        return App("Tensor.reshapeSpec",
+                   (Atom(f"(target := [{', '.join(target)}])"), value, Atom("(by simp [Shape.size])")))
 
     def node(self, n, env: dict, ctx: Context) -> LoweredValue | None:
         """Refuse non-ATen nodes unless a subclass supplies their translation."""
@@ -313,10 +364,10 @@ class FxEmitter:
             elif isinstance(n.target, torch._ops.OpOverload) and op_name(n) not in self.size_ops:
                 env[n] = self.aten(n, env)
                 if len(n.users) > 1:
-                    ctx.lets.append(f"let v_{n.name} := {unparen(env[n].expr)}")
-                    env[n] = dataclasses.replace(env[n], expr=f"v_{n.name}")
+                    ctx.lets.append(f"let v_{n.name} := {env[n].expr.show()}")
+                    env[n] = dataclasses.replace(env[n], expr=Atom(f"v_{n.name}"))
             elif op_name(n) in self.size_ops:
-                env[n] = LoweredValue(self.sym(n.meta["val"]), Kind.SIZE)
+                env[n] = LoweredValue(Atom(self.sym(n.meta["val"])), Kind.SIZE)
             else:
                 value = self.node(n, env, ctx)
                 if value is not None:
@@ -324,7 +375,7 @@ class FxEmitter:
         if not results:
             last = unparen(ctx.state)
         elif len(results) == 1:
-            last = unparen(results[0].expr)
+            last = results[0].expr.show()
         else:
-            last = f"({', '.join(unparen(r.expr) for r in results)})"
+            last = Tup(tuple(r.expr for r in results)).show()
         return LoweredGraph("\n".join(ctx.lets + [last]), results)

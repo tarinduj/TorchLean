@@ -12,7 +12,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))  # the sibling module `fx_emitter`
 import fx_emitter  # noqa: E402
-from fx_emitter import Context, Element, Kind, LoweredValue  # noqa: E402
+from fx_emitter import App, Atom, Context, Element, Kind, LoweredValue, Tup  # noqa: E402
 
 refuse, invalid = fx_emitter.refuse, fx_emitter.invalid
 
@@ -67,9 +67,14 @@ def _component(name: str, i: int, count: int) -> str:
     return name + ".2" * i + ("" if i == count - 1 else ".1")
 
 
-def _tile_args(blocks: list[int], bounds: list[str]) -> str:
-    """Print a tile's block sizes and loop bounds, the first arguments of the tile ops: `[B0, B1] ![d0, d1]`."""
-    return f"[{', '.join(f'B{b}' for b in blocks)}] ![{', '.join(bounds)}]"
+def _tile_args(blocks: list[int], bounds: list[str]) -> tuple[Atom, Atom]:
+    """Return a tile's block sizes and loop bounds, the first two arguments of the tile ops: `[B0, B1]`, `![d0, d1]`."""
+    return Atom(f"[{', '.join(f'B{b}' for b in blocks)}]"), Atom(f"![{', '.join(bounds)}]")
+
+
+def _tiles(tiles: list[str]) -> Atom:
+    """Return a tile's index on each axis: `![tile0, 0]`."""
+    return Atom(f"![{', '.join(tiles)}]")
 
 
 def _doc_comment(text: str) -> str:
@@ -426,7 +431,7 @@ class Emitter(fx_emitter.FxEmitter):
         axis, keepdim = kind["axes"][0], kind["keepdim"]
         blocks, bounds, tiles = self._tile_layout(operand)
         original = env[operand.args[0]].expr  # The tile before `_mask_to`; `maskedMax` skips its masked lanes.
-        call = f"(maskedMax {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] {axis} {original})"
+        call = App("maskedMax", (*_tile_args(blocks, bounds), _tiles(tiles), Atom(str(axis)), original))
         # Restore the singleton axis when keepdim=True.
         return LoweredValue(self.reshape(call, self.shape(ir_node)) if keepdim else call, Kind.COMPUTED)
 
@@ -450,23 +455,23 @@ class Emitter(fx_emitter.FxEmitter):
         # Promote real operands; the result stays extended.
         promoted = {
             arg: env[arg] if env[arg].element is not Element.REAL
-            else LoweredValue(f"(toEReal {env[arg].expr})", Kind.COMPUTED, element=Element.EREAL_FINITE)
+            else LoweredValue(App("toEReal", (env[arg].expr,)), Kind.COMPUTED, element=Element.EREAL_FINITE)
             for arg in ir_node.args}
         if op == "exp.default":
-            return LoweredValue(f"(expE {env[ir_node.args[0]].expr})", Kind.COMPUTED)
+            return LoweredValue(App("expE", (env[ir_node.args[0]].expr,)), Kind.COMPUTED)
         elif op == "maximum.default":
             operands = self.elementwise_operands(ir_node, ir_node.args, promoted)
             # The max is `⊥` only where every operand is.
             all_may_be_bottom = all(promoted[arg].element is Element.EREAL_MAY_BE_BOTTOM for arg in ir_node.args)
             element = Element.EREAL_MAY_BE_BOTTOM if all_may_be_bottom else Element.EREAL_FINITE
-            return LoweredValue(f"(Tensor.map2Spec max {' '.join(operands)})", Kind.COMPUTED, element=element)
+            return LoweredValue(App("Tensor.map2Spec", (Atom("max"), *operands)), Kind.COMPUTED, element=element)
         elif op == "sub.Tensor":
             minuend, subtrahend = ir_node.args
             # A finite value minus `⊥` is `⊤`, which `expE` gets wrong.
             if env[subtrahend].element is Element.EREAL_MAY_BE_BOTTOM:
                 refuse("only subtracting values that cannot be -inf is supported")
             operands = self.elementwise_operands(ir_node, ir_node.args, promoted)
-            return LoweredValue(f"(Tensor.map2Spec (· - ·) {' '.join(operands)})", Kind.COMPUTED,
+            return LoweredValue(App("Tensor.map2Spec", (Atom("(· - ·)"), *operands)), Kind.COMPUTED,
                                 element=promoted[minuend].element)
         else:
             refuse("extended reals are supported only in maximum, subtraction and exp")
@@ -485,16 +490,16 @@ class Emitter(fx_emitter.FxEmitter):
             if args[0] not in self.lean_inputs and args[0] != self.output_name:
                 refuse("only the arguments and the output are supported in device code")
             if args[0] in self.lean_inputs:
-                return LoweredValue(self.lean_inputs[args[0]], Kind.INPUT)
+                return LoweredValue(Atom(self.lean_inputs[args[0]]), Kind.INPUT)
             else:
                 return LoweredValue(None, Kind.OUTPUT)
         elif op == "full":
-            shape = ", ".join(self.shape(ir_node))
+            shape = Atom(f"[{', '.join(self.shape(ir_node))}]")
             if args[1] == 0:
-                return LoweredValue(f"(Tensor.zeros [{shape}])", Kind.COMPUTED)
+                return LoweredValue(App("Tensor.zeros", (shape,)), Kind.COMPUTED)
             elif args[1] == float("-inf"):
                 # ℝ has no -inf: it is the extended real `⊥`.
-                return LoweredValue(f"(Tensor.full [{shape}] (⊥ : EReal))", Kind.COMPUTED,
+                return LoweredValue(App("Tensor.full", (shape, Atom("(⊥ : EReal)"))), Kind.COMPUTED,
                                             element=Element.EREAL_MAY_BE_BOTTOM)
             else:
                 refuse("only 0 and -inf fills are supported")
@@ -527,7 +532,7 @@ class Emitter(fx_emitter.FxEmitter):
             elif args[1] == 0:
                 blocks, bounds, tiles = self._tile_layout(ir_node)
                 return LoweredValue(
-                    f"(maskTo {_tile_args(blocks, bounds)} ![{', '.join(tiles)}] 0 {env[args[0]].expr})",
+                    App("maskTo", (*_tile_args(blocks, bounds), _tiles(tiles), Atom("0"), env[args[0]].expr)),
                     Kind.COMPUTED)
             else:
                 refuse("only _mask_to with fill 0 or -inf is supported")
@@ -540,7 +545,7 @@ class Emitter(fx_emitter.FxEmitter):
             blocks, bounds, tiles = self._indexed_tile_layout(ir_node, indices, ctx)
             self._record_in_bounds(bounds, self.shape(source))
             return LoweredValue(
-                f"(loadTile {_tile_args(blocks, bounds)} 0 {env[source].expr} ![{', '.join(tiles)}])",
+                App("loadTile", (*_tile_args(blocks, bounds), Atom("0"), env[source].expr, _tiles(tiles))),
                 Kind.COMPUTED)
         elif op == "store":
             destination, indices, value = args[0], args[1], args[2]
@@ -559,7 +564,8 @@ class Emitter(fx_emitter.FxEmitter):
             self._record_in_bounds(bounds, self.output_shape)
             self.store_count += 1
             ctx.state = (
-                f"(storeTile {_tile_args(blocks, bounds)} {ctx.state} ![{', '.join(tiles)}] {env[value].expr})"
+                App("storeTile",
+                    (*_tile_args(blocks, bounds), Atom(ctx.state), _tiles(tiles), env[value].expr)).show_as_argument()
             )
         else:
             refuse(f"device op {op} is not supported")
@@ -603,8 +609,8 @@ class Emitter(fx_emitter.FxEmitter):
             starts = [env[initial_values[a]].element for a in carried]
             for i, (argument, start) in enumerate(zip(carried, starts)):
                 arguments[placeholders[argument]] = LoweredValue(
-                    _component(accumulator, i, count), Kind.COMPUTED, element=start)
-            initial = f"({', '.join(fx_emitter.unparen(env[initial_values[a]].expr) for a in carried)})"
+                    Atom(_component(accumulator, i, count)), Kind.COMPUTED, element=start)
+            initial = Tup(tuple(env[initial_values[a]].expr for a in carried)).show()
             body = self.emit_graph(loop_graph.graph, {**env, **arguments}, Context(nest=nest))
             ends = [result.element for result in body.results]
             for start, end in zip(starts, ends):
@@ -621,9 +627,9 @@ class Emitter(fx_emitter.FxEmitter):
                 f"fun tile{block_id} {accumulator} =>\n{_indent(body.code, 2)}"
             )
             # After the loop, each carried value has the entries its body produces.
-            parts = tuple(LoweredValue(_component(accumulator, i, count), Kind.COMPUTED, element=end)
+            parts = tuple(LoweredValue(Atom(_component(accumulator, i, count)), Kind.COMPUTED, element=end)
                           for i, end in enumerate(ends))
-            return LoweredValue(accumulator, Kind.TUPLE, parts)
+            return LoweredValue(Atom(accumulator), Kind.TUPLE, parts)
 
     def emit(self, name: str, source: str) -> str:
         """Emit the complete Lean module for the outer `hl.tile` grid loop and its body."""
