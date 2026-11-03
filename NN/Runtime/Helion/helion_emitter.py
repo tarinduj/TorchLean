@@ -448,6 +448,8 @@ class Emitter(fx_emitter.FxEmitter):
             expE (Tensor.map2Spec max (Tensor.full [B0, B1] (⊥ : EReal)) (toEReal (loadTile …)))
         """
         op = fx_emitter.op_name(ir_node)
+        if not all(isinstance(arg, torch.fx.Node) for arg in ir_node.args):
+            refuse("only extended-real ops on tensors are supported")
         # Promote real operands; the result stays extended.
         promoted = {
             arg: env[arg] if env[arg].element is not Element.REAL
@@ -644,7 +646,7 @@ class Emitter(fx_emitter.FxEmitter):
         output_shape = ", ".join(self.output_shape)
         block_parameters = " ".join(f"B{block}" for block in sorted(self.block_ids.values()))
         positivity_hypotheses = [
-            f"(h{dimension} : 0 < {dimension})" for dimension in sorted(self.hyps)
+            f"(h{dimension} : 0 < {dimension})" for dimension in sorted(self.nonempty_dims)
         ]
         signature = fx_emitter.print_def(
             "noncomputable def kernel",

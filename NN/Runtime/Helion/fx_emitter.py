@@ -4,6 +4,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 import enum
+import fractions
 
 import torch
 
@@ -22,10 +23,11 @@ def size_name(i: int) -> str:
 
 # The bridge targets TorchLean's graph IR, which has no division operator.
 # Our direct translation supports tensor division through `Tensor.divSpec`.
-_DIRECT_ONLY_KINDS = {"div.Tensor": {"kind": "div"}}
-# Binary elementwise kinds and their TorchLean ops; operands are broadcast to the output shape.
-_BINARY_ELEMENTWISE_KINDS = {
-    "add": "addSpec", "sub": "subSpec", "mul_elem": "mulSpec", "div": "divSpec", "max_elem": "maxSpec"}
+# Binary elementwise ATen ops and their TorchLean ops; each operand, a node or a number, is brought to
+# the output shape.
+_ELEMENTWISE_OPS = {
+    "add.Tensor": "Tensor.addSpec", "sub.Tensor": "Tensor.subSpec", "mul.Tensor": "Tensor.mulSpec",
+    "div.Tensor": "Tensor.divSpec", "maximum.default": "Tensor.maxSpec"}
 
 
 def refuse(msg: str):
@@ -54,17 +56,26 @@ def print_def(head: str, binders: list[str], result: str) -> str:
     return "\n".join(lines + [cur])
 
 
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def real_literal(value: int | float) -> Atom:
+    """Print a Python number as the real it is exactly: `0.125` → `(1 / 8 : ℝ)`."""
+    exact = fractions.Fraction(value)
+    if exact.denominator == 1:
+        return Atom(f"({exact.numerator} : ℝ)")
+    return Atom(f"({exact.numerator} / {exact.denominator} : ℝ)")
+
+
 def _nonempty_axis(size: str) -> Atom:
     """Prove a reduced axis is nonempty from its size's positivity hypothesis."""
     return Atom(f"(.succ (Shape.hasNonemptyAxisZeroOfPos h{size}).proof)")
 
 
-def print_op(kind: dict, args: list[Term], shapes: list[list[str]]) -> tuple[App, set[str]]:
-    """Print one normalized op and return the dimensions it requires to be positive."""
-    if kind["kind"] in _BINARY_ELEMENTWISE_KINDS and len(kind) == 1:
-        if len(args) != 2:
-            refuse(f"{kind['kind']} with a scalar operand is not supported")
-        return App(f"Tensor.{_BINARY_ELEMENTWISE_KINDS[kind['kind']]}", (args[0], args[1])), set()
+def lower_op(kind: dict, args: list[Term], shapes: list[list[str]]) -> tuple[App, set[str]]:
+    """Build one normalized op's TorchLean term and the dims it requires to be nonempty, e.g. `d1` for
+    a sum over axis 1."""
     if kind == {"kind": "matmul"} and len(shapes) == 2 and len(shapes[0]) == len(shapes[1]) == 2:
         return App("matMulSpec", (args[0], args[1])), set()
     if kind == {"kind": "relu"}:
@@ -284,7 +295,7 @@ class FxEmitter:
     size_ops = ("sym_size.int", "sym_size")  # ops whose value is a symbolic size
 
     def __init__(self, bridge, names: dict):
-        self.bridge, self.names, self.hyps = bridge, names, set()
+        self.bridge, self.names, self.nonempty_dims = bridge, names, set()
         # _lower_kind uses this map when interpreting symbolic dimensions.
         bridge._DIM_NAMES = dict(names)
 
@@ -304,31 +315,37 @@ class FxEmitter:
         Each value keeps its captured shape: an elementwise operand is broadcast to the node's
         shape, and a `keepdim` reduction is reshaped to it.
         """
+        if op_name(n) in _ELEMENTWISE_OPS:
+            if n.kwargs or len(n.args) != 2:
+                refuse(f"only {op_name(n)} of two operands without options is supported")
+            args = self.elementwise_operands(n, n.args, env)
+            return LoweredValue(App(_ELEMENTWISE_OPS[op_name(n)], tuple(args)), Kind.COMPUTED)
         operands = self.bridge._node_refs((n.args, n.kwargs), {m: m for m in n.all_input_nodes})
         if op_name(n) == "amax.default":
             # The IR has no max over an axis either; it prints as `Tensor.reduceMax`.
             kind = amax_kind(n)
-        elif op_name(n) in _DIRECT_ONLY_KINDS:
-            kind = _DIRECT_ONLY_KINDS[op_name(n)]
         else:
             kind = self.bridge._lower_kind(n)
-        if kind["kind"] in _BINARY_ELEMENTWISE_KINDS:
-            args = self.elementwise_operands(n, operands, env)
-            shapes = [self.shape(n)] * len(operands)
-        else:
-            args, shapes = [env[p].expr for p in operands], [self.shape(p) for p in operands]
+        args, shapes = [env[p].expr for p in operands], [self.shape(p) for p in operands]
         # TorchLean reductions drop the axis; reshape below restores it for keepdim=True.
         keepdim = bool(kind.get("keepdim"))
         if keepdim:
             kind = {**kind, "keepdim": False}
-        call, positive = print_op(kind, args, shapes)
-        self.hyps |= positive
+        call, nonempty_dims = lower_op(kind, args, shapes)
+        self.nonempty_dims |= nonempty_dims
         return LoweredValue(self.reshape(call, self.shape(n)) if keepdim else call, Kind.COMPUTED)
 
     def elementwise_operands(self, n, operands, env: dict) -> list[Term]:
-        """Broadcast each operand of elementwise `n`, as printed in `env`, to `n`'s shape."""
+        """Bring each operand of elementwise `n` to `n`'s shape: broadcast a node as printed in `env`,
+        fill a constant tensor with a number."""
         target = self.shape(n)
-        return [self.broadcast(env[p].expr, self.shape(p), target) for p in operands]
+        prepared = []
+        for p in operands:
+            if _is_number(p):
+                prepared.append(App("Tensor.full", (Atom(f"[{', '.join(target)}]"), real_literal(p))))
+            else:
+                prepared.append(self.broadcast(env[p].expr, self.shape(p), target))
+        return prepared
 
     def broadcast(self, value: Term, shape: list[str], target: list[str]) -> Term:
         """Broadcast `value` between equal-rank shapes; each axis of `shape` must match `target` or be `1`."""
