@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import enum
 import pathlib
 import sys
 import textwrap
@@ -14,6 +15,26 @@ import fx_emitter  # noqa: E402
 from fx_emitter import Context, Element, Kind, LoweredValue  # noqa: E402
 
 refuse, invalid = fx_emitter.refuse, fx_emitter.invalid
+
+
+class Role(enum.Enum):
+    """Which side of the goal a predicate goes on."""
+    CONDITION = enum.auto()  # assumed by the goal
+    OBLIGATION = enum.auto()  # proved by the goal
+
+
+@dataclasses.dataclass
+class Predicate:
+    """A Lean predicate over sizes that collects facts, e.g. `InBounds d0 d1 d2 d3 := d0 ≤ d2 ∧ d1 ≤ d3`."""
+    name: str
+    doc: str
+    role: Role
+    params: list[str]
+    facts: list[str] = dataclasses.field(default_factory=list)  # e.g. `d0 ≤ d2`, each once
+
+    def add(self, fact: str):
+        if fact not in self.facts:
+            self.facts.append(fact)
 
 
 def _indent(text: str, spaces: int) -> str:
@@ -133,10 +154,19 @@ class Emitter(fx_emitter.FxEmitter):
         super().__init__(bridge, dimension_names | block_names)
         self.output_name = self._validate_host_and_find_output()
         self.store_count = 0
-        self.in_bounds = []   # loop bound ≤ tensor size, for every load and store; trivial ones omitted
-        self.full_slices = []  # axis size ≤ block size, for every full slice (`:`)
+        sizes = self.dim_names + [f"B{b}" for b in sorted(self.block_ids.values())]
+        # Axis size ≤ block size, for every full slice (`:`).
+        self.full_slices = Predicate(
+            "FullSliceCovered", "Each full slice (`:`) fits in one block.", Role.CONDITION, sizes)
+        # Loop bound ≤ tensor size, for every load and store; trivial ones omitted.
+        self.in_bounds = Predicate(
+            "InBounds", "Every lane the loads' and stores' masks enable lies inside its tensor.",
+            Role.OBLIGATION, self.dim_names)
         # Loops that must run at least once, as `0 < extent` and `0 < block`.
-        self.nonempty_loops = []
+        self.nonempty_loops = Predicate(
+            "LoopsNonempty", "Each loop that turns a -inf start into a finite value runs at least once.",
+            Role.OBLIGATION, sizes)
+        self.predicates = [self.full_slices, self.in_bounds, self.nonempty_loops]
         self.carried_arguments = self._carried_arguments()
 
     def _loop_results(self, loop) -> list:
@@ -311,8 +341,8 @@ class Emitter(fx_emitter.FxEmitter):
         if len(bounds) != len(dimensions):
             invalid(f"tile of rank {len(bounds)} on a tensor of rank {len(dimensions)}")
         for bound, size in zip(bounds, dimensions, strict=True):
-            if bound != size and f"{bound} ≤ {size}" not in self.in_bounds:
-                self.in_bounds.append(f"{bound} ≤ {size}")
+            if bound != size:
+                self.in_bounds.add(f"{bound} ≤ {size}")
 
     def _tile_layout(self, ir_node) -> tuple[list[int], list[str], list[str]]:
         """Find each tile axis's block ID, loop bound and tile index.
@@ -330,8 +360,7 @@ class Emitter(fx_emitter.FxEmitter):
                 # Represent the full slice (`:`) with one block starting at index 0.
                 # Require that block to cover the axis, e.g. `d1 ≤ B1`.
                 bound = self.sym(info.size)
-                if f"{bound} ≤ B{block}" not in self.full_slices:
-                    self.full_slices.append(f"{bound} ≤ B{block}")
+                self.full_slices.add(f"{bound} ≤ B{block}")
                 tiles.append("0")
             else:
                 tiles.append(f"tile{block}")
@@ -586,9 +615,8 @@ class Emitter(fx_emitter.FxEmitter):
                     refuse("only loops that keep a finite carried value finite are supported")
                 # A `⊥` start ends finite only if the loop runs, e.g. a running max from -inf.
                 if start is Element.EREAL_MAY_BE_BOTTOM and end is Element.EREAL_FINITE:
-                    for fact in (f"0 < {extent}", f"0 < B{block_id}"):
-                        if fact not in self.nonempty_loops:
-                            self.nonempty_loops.append(fact)
+                    self.nonempty_loops.add(f"0 < {extent}")
+                    self.nonempty_loops.add(f"0 < B{block_id}")
             ctx.lets.append(
                 f"let {accumulator} := forTiles {extent} B{block_id} {initial} "
                 f"fun tile{block_id} {accumulator} =>\n{_indent(body, 2)}"
@@ -612,7 +640,7 @@ class Emitter(fx_emitter.FxEmitter):
         # reduction-loop graphs, which split full slices into chunks.
         if (
             any(type(graph).__name__ == "ReductionLoopGraphInfo" for graph in self.device_ir.graphs)
-            and not self.full_slices
+            and not self.full_slices.facts
         ):
             invalid("device IR has reduction-loop graphs but the root graph has no full slice")
         if self.store_count == 0:
@@ -643,7 +671,7 @@ class Emitter(fx_emitter.FxEmitter):
             for depth, block in enumerate(self.grid_blocks)
         )
         # With full slices, Helion also has reduction-loop graphs that other configs run.
-        scope = " This is Helion's root device IR, run by configs without reduction loops." if self.full_slices else ""
+        scope = " This is Helion's root device IR, run by configs without reduction loops." if self.full_slices.facts else ""
         docstring = _doc_comment(
             f"Run the Helion `{self.fn_name}` kernel on {inputs}, writing into the output buffer `out0`.{scope}"
         )
