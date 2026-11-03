@@ -200,6 +200,13 @@ class Kind(enum.Enum):
     TUPLE = enum.auto()  # the values a loop carries, one part each
 
 
+class Element(enum.Enum):
+    """What a lowered tensor's entries are. Extended reals here are never `⊤`."""
+    REAL = enum.auto()
+    EREAL_FINITE = enum.auto()  # extended reals, each finite
+    EREAL_MAY_BE_BOTTOM = enum.auto()  # extended reals, each finite or `⊥`, e.g. a running max from -inf
+
+
 @dataclasses.dataclass(frozen=True)
 class LoweredValue:
     """A graph node's Lean expression and what it represents.
@@ -213,6 +220,7 @@ class LoweredValue:
     expr: str | None  # Lean text; None for output buffers and nodes printed by their users
     kind: Kind
     parts: tuple[LoweredValue, ...] = ()  # a tuple's values, in order; empty for other kinds
+    element: Element = Element.REAL  # what a tensor's entries are
 
 
 class FxEmitter:
@@ -299,7 +307,7 @@ class FxEmitter:
                 env[n] = self.aten(n, env)
                 if len(n.users) > 1:
                     ctx.lets.append(f"let v_{n.name} := {unparen(env[n].expr)}")
-                    env[n] = LoweredValue(f"v_{n.name}", Kind.COMPUTED)
+                    env[n] = dataclasses.replace(env[n], expr=f"v_{n.name}")
             elif op_name(n) in SYM_OPS:
                 env[n] = LoweredValue(self.sym(n.meta["val"]), Kind.SIZE)
             else:
