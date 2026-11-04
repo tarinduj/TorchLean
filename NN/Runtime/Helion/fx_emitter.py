@@ -78,6 +78,8 @@ def lower_op(kind: dict, args: list[Term], shapes: list[list[str]]) -> tuple[App
     a sum over axis 1."""
     if kind == {"kind": "matmul"} and len(shapes) == 2 and len(shapes[0]) == len(shapes[1]) == 2:
         return App("matMulSpec", (args[0], args[1])), set()
+    if kind == {"kind": "permute", "perm": [1, 0]}:
+        return App("Tensor.swapAdjacentAxes", (args[0], Atom("0"))), set()
     if kind == {"kind": "relu"}:
         return App("Activation.reluSpec", (args[0],)), set()
     if kind == {"kind": "exp"}:
@@ -324,6 +326,9 @@ class FxEmitter:
         if op_name(n) == "amax.default":
             # The IR has no max over an axis either; it prints as `Tensor.reduceMax`.
             kind = amax_kind(n)
+        elif op_name(n) == "numpy_T.default":
+            # The bridge does not read `x.T` either; it reverses the axes.
+            kind = {"kind": "permute", "perm": list(reversed(range(len(self.shape(n)))))}
         else:
             kind = self.bridge._lower_kind(n)
         args, shapes = [env[p].expr for p in operands], [self.shape(p) for p in operands]
