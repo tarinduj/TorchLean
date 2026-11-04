@@ -151,12 +151,25 @@ class App(Term):
 
     def layout(self, indent: int) -> list[str]:
         """Keep the head and the arguments that fit on the first line; put each other argument below,
-        two deeper. A trailing `fun` stays on the first line, its body below."""
+        two deeper. A trailing `fun` follows the last argument, four deeper if it does not fit, its
+        body below."""
         pad = " " * indent
         if self.args and isinstance(self.args[-1], Fun):
             *args, fun = self.args
             first = " ".join([self.head, *(arg.show_as_argument() for arg in args), fun.header()])
-            return [pad + first] + fun.body.layout(indent + 2)
+            if indent + len(first) <= WIDTH:
+                return [pad + first] + fun.body.layout(indent + 2)
+            lines = [pad + self.head]
+            for arg in args:
+                if len(lines[-1]) + 1 + len(arg.show_as_argument()) <= WIDTH:
+                    lines[-1] += " " + arg.show_as_argument()
+                else:
+                    lines += arg.layout_as_argument(indent + 4)
+            if len(lines[-1]) + 1 + len(fun.header()) <= WIDTH:
+                lines[-1] += " " + fun.header()
+            else:
+                lines.append(" " * (indent + 4) + fun.header())
+            return lines + fun.body.layout(indent + 2)
         if indent + len(self.show()) <= WIDTH:
             return [pad + self.show()]
         first, rest = self.head, list(self.args)
@@ -206,12 +219,15 @@ class Let(Term):
         return f"let {self.name} := {self.value.show()}\n{self.body.show()}"
 
     def layout(self, indent: int) -> list[str]:
-        """Put the value after `:=` when it fits or ends in a `fun`; otherwise below, two deeper."""
+        """Put the value after `:=` when its first line fits there; otherwise below, two deeper."""
         pad, head = " " * indent, f"let {self.name} :="
         if "\n" in self.value.show():
             # A value with a function body, e.g. a loop: its first line follows `:=`.
             value = self.value.layout(indent)
-            binding = [pad + head + " " + value[0].lstrip()] + value[1:]
+            if len(pad + head + " " + value[0].lstrip()) <= WIDTH:
+                binding = [pad + head + " " + value[0].lstrip()] + value[1:]
+            else:
+                binding = [pad + head] + self.value.layout(indent + 2)
         elif indent + len(head) + 1 + len(self.value.show()) <= WIDTH:
             binding = [pad + head + " " + self.value.show()]
         else:
